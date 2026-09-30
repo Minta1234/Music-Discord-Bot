@@ -255,7 +255,11 @@ async function tiktokMetaOnce(pageUrl) {
   const title = d.title || (d.music_info && d.music_info.title) || pageUrl;
   const thumb = d.cover || d.origin_cover || d.ai_dynamic_cover || null;
   const author = (d.author && (d.author.nickname || d.author.unique_id)) || null;
-  return { title: String(title), thumb, audioUrl: String(music), duration: d.duration || null, author };
+  const videoId = d.id ? String(d.id) : null;
+  // TikWM proxy URL works from any IP (incl. cloud/Railway);
+  // TikTok CDN URL (music) is blocked on datacenter IPs.
+  const proxyAudioUrl = videoId ? `https://www.tikwm.com/video/music/${videoId}.mp3` : null;
+  return { title: String(title), thumb, audioUrl: String(music), proxyAudioUrl, videoId, duration: d.duration || null, author };
 }
 function tiktokHeaders() {
   return "User-Agent: Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/126.0 Safari/537.36\r\n"
@@ -2244,7 +2248,7 @@ function spawnUniversalPipe(source, playerClient, offsetSec) {
   if (!FFMPEG_AVAILABLE) throw new Error("ffmpeg binary not available");
 
   // ── yt-dlp ───────────────────────────────────────────────────────────────
-  const isTikTok = source.includes("tiktok.com") || source.includes("vt.tiktok.com");
+  const isTikTok = source.includes("tiktok.com") || source.includes("vt.tiktok.com") || source.includes("workers.dev");
   const ytArgs = [];
   if (config.ytdlpForceIpv4) ytArgs.push("--force-ipv4");
   const ckFile = effectiveCookieFile();
@@ -2833,28 +2837,33 @@ async function startPlayback(guild, item, state, stayPut = false) {
     source = `ytsearch1:${source}`;
   }
 
-  // TikTok: metadata (title/thumb) via TikWM, audio fetched with node-fetch
-  // and piped to ffmpeg stdin. Works for /video/ AND /photo/ posts (yt-dlp
-  // can't handle photo URLs at all). Falls back to yt-dlp pipe on failure.
+  // TikTok: metadata via TikWM. Audio is streamed via Cloudflare Worker proxy
+  // to avoid Railway/AWS datacenter IP blocks. Falls back to yt-dlp.
   if (isTikTokUrl(source)) {
     try {
       const meta = await tiktokMeta(source);
       if (item.title === item.source) item.title = meta.title;
       if (!item.thumb && meta.thumb) item.thumb = meta.thumb;
-      logPretty("LOG", `[tikwm] audio <- ${meta.audioUrl.slice(0, 90)}...`);
-      const res = await fetch(meta.audioUrl, {
-        headers: {
-          "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/126.0 Safari/537.36",
-          "Referer": "https://www.tiktok.com/",
-        }
+      
+      // Use the Cloudflare proxy to fetch the TikTok CDN URL
+      const cfProxyUrl = "https://bold-wood-cfdb.locallocal065.workers.dev/?url=" + encodeURIComponent(meta.audioUrl);
+      logPretty("LOG", `[tikwm] audio via CF proxy (fetch) <- ${meta.audioUrl.slice(0, 90)}...`);
+      
+      // Node.js fetch() easily bypasses Cloudflare's Bot Fight Mode which was blocking
+      // ffmpeg and yt-dlp on Railway datacenter IPs. We fetch the stream and pipe it.
+      const res = await fetch(cfProxyUrl, {
+        headers: { 'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/126.0 Safari/537.36' }
       });
-      if (!res.ok || !res.body) throw new Error('tiktok audio HTTP ' + res.status);
-      const pipeObj = spawnFfmpegStdin("tiktok", consumeOffset(item, state));
-      Readable.fromWeb(res.body).on("error", swallowPipeError).pipe(pipeObj.ff.stdin);
+      if (!res.ok) throw new Error(`CF proxy returned ${res.status}`);
+      
+      const { Readable } = require("stream");
+      const pipeObj = spawnFfmpegStdin("tiktok-cf", consumeOffset(item, state));
+      Readable.fromWeb(res.body).pipe(pipeObj.ff.stdin);
+      
       await playPipe(guild, item, state, pipeObj);
       return { pageUrl: source };
     } catch (e) {
-      logPretty("WARN", "tiktok direct failed, falling back to yt-dlp: " + (e?.message || e));
+      logPretty("WARN", `[tikwm] failed (${e?.message || e}), falling back to direct yt-dlp`);
     }
   }
 
@@ -3983,7 +3992,6 @@ function dashPlayerPageTailwind() {
   + 'function paint(){var g=PG.snap;if(!g)return;var n=g.nowPlaying;document.getElementById("ttl").textContent=n?n.title:"\u2014 idle \u2014";document.getElementById("by").textContent=n?"Requested by "+n.by:"Choose a server and queue a track.";var c=document.getElementById("cover");var ph=document.getElementById("cover-ph");if(n&&n.thumb){c.classList.remove("hidden");ph.classList.add("hidden");if(c.getAttribute("src")!==n.thumb)c.src=n.thumb;}else{c.classList.add("hidden");ph.classList.remove("hidden");}'
   + 'var lc=document.getElementById("lyrics-container");if(n&&n.lyrics&&n.lyrics.synced&&n.lyrics.synced.length){lc.classList.remove("hidden");if(lc.dataset.title!==n.title){lc.innerHTML="";lc.dataset.title=n.title;n.lyrics.synced.forEach(function(l){var p=document.createElement("p");p.className="lyric-line transition-all duration-300";p.dataset.time=l.t;p.textContent=l.text||"♪";lc.appendChild(p);});}var sp=n.speed||1;var base=n.posBase||0;var t0=n.startedAt||PG.snapAt;var el=base+Math.max(0,(Date.now()-t0)/1000)*sp;var lines=Array.from(lc.children);var aIdx=-1;for(var i=0;i<lines.length;i++){if(parseFloat(lines[i].dataset.time)<=el)aIdx=i;else break;}lines.forEach(function(p,i){if(i===aIdx){if(!p.classList.contains("active")){p.classList.add("active");p.style.color="#fcd34d";p.style.transform="scale(1.1)";lc.scrollTop=p.offsetTop-lc.offsetTop-(lc.clientHeight/2)+(p.clientHeight/2);}}else{p.classList.remove("active");p.style.color="";p.style.transform="";}});}else{lc.classList.add("hidden");lc.dataset.title="";}'
   + 'var dur=n&&n.durationSec?n.durationSec:null;var spp=(n&&n.speed)||1;var bs=(n&&n.posBase)||0;var t0b=(n&&n.startedAt)?n.startedAt:PG.snapAt;var elb=bs+Math.max(0,(Date.now()-t0b)/1000)*spp;document.getElementById("tcur").textContent=fmtT(elb);if(dur){document.getElementById("tdur").textContent=fmtT(dur);var pct=Math.max(0,Math.min(100,elb/dur*100));document.getElementById("tfill").style.width=pct+"%";document.getElementById("timebar").title="Click to seek";}else{document.getElementById("tdur").innerHTML="<span id=\'live-dot\' style=\'display:inline-block;width:8px;height:8px;border-radius:50%;background:#fcd34d;margin-right:4px;animation:live-pulse 1.5s ease-in-out infinite\'></span>LIVE";document.getElementById("tfill").style.width="100%";document.getElementById("tfill").style.opacity="0.25";document.getElementById("timebar").title="Live stream — cannot seek";}'
-  + '@keyframes live-pulse{0%,100%{opacity:1}50%{opacity:.4}}'
   + 'document.getElementById("pp").textContent=g.player==="paused"?"▶️":"⏸️";document.getElementById("loopb").textContent="Loop · "+g.loop;var v=document.getElementById("vol");if(document.activeElement!==v)v.value=g.volume;var q=document.getElementById("q");q.innerHTML="";(g.queue||[]).forEach(function(x){var li=document.createElement("li");li.className="flex gap-3 py-3";var index=document.createElement("span");index.className="font-mono text-xs text-amber-300";index.textContent=String(q.children.length+1).padStart(2,"0");var title=document.createElement("span");title.className="min-w-0 truncate";title.textContent=x.title||"";li.appendChild(index);li.appendChild(title);q.appendChild(li);});if(!q.children.length){var empty=document.createElement("li");empty.className="py-4 text-sm text-zinc-500";empty.textContent="Queue is empty";q.appendChild(empty);}}'
   + 'function fmtT(s){if(s==null||!isFinite(s)||s<0)return"• LIVE";s=Math.floor(s);var m=Math.floor(s/60);s=s%60;return m+":"+(s<10?"0":"")+s;}'
   + 'document.getElementById("timebar").addEventListener("click",async function(ev){var g=cur();if(!g||!g.nowPlaying||!g.nowPlaying.durationSec){say("Live stream — cannot seek");return;}var r=this.getBoundingClientRect();var ratio=Math.max(0,Math.min(1,(ev.clientX-r.left)/r.width));var sec=Math.floor(ratio*g.nowPlaying.durationSec);try{await api("/api/seek",{guildId:gid(),seconds:sec});say("Seek → "+fmtT(sec));refresh();}catch(e){say(e.message);}});'
