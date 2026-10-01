@@ -190,6 +190,8 @@ All commands are Discord slash commands — the legacy `n!` prefix was removed:
 - Dashboard protected with login + rate limiting
 - Bot responses that only you should see are **ephemeral** (private)
 
+
+by the default Script :https://github.com/Minta1234/Music-Discord-Bot/blob/a8ba26aa92d3d446868becec777962023f95f528/defaultbot.js
 ---
 Refference:
 https://github.com/ninjamadeena/music-discord-bot
