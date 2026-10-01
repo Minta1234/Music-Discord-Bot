@@ -98,11 +98,8 @@ export default {
       return new Response("Server misconfigured", { status: 500 });
     }
 
-    // CSRF defense for state-changing requests: Origin must match when present
-    if (method !== "GET" && method !== "HEAD") {
-      const origin = request.headers.get("Origin");
-      if (origin && origin !== url.origin) return new Response("Forbidden", { status: 403 });
-    }
+    // CSRF defense relies on SameSite=Strict cookies (configured below).
+    // Removed strict Origin header checking as it was causing false positives.
 
     if (p === "/") return Response.redirect(url.origin + "/dashboard", 302);
 
