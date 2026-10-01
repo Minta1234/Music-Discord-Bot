@@ -57,7 +57,8 @@ function aiSystemInstruction(persona = "") {
 }
 const GEMINI_QUOTA_COOLDOWN_MS = 15 * 60 * 1000;
 let geminiQuotaCooldownUntil = 0;
-async function askOpenRouter(question, history = [], persona = "") {
+async function askOpenRouter(question, history = [], persona = "", _retryModel = null) {
+  const model = _retryModel || config.openRouterModel;
   const controller = new AbortController();
   const timeout = setTimeout(() => controller.abort(), 30000);
   try {
@@ -76,17 +77,32 @@ async function askOpenRouter(question, history = [], persona = "") {
         "HTTP-Referer": "https://discord.com",
         "X-Title": "Discord Music Bot",
       },
-      body: JSON.stringify({ model: config.openRouterModel, messages, max_tokens: 1024 }),
+      body: JSON.stringify({ model, messages, max_tokens: 1024 }),
     });
     const data = await response.json().catch(() => null);
     if (!response.ok) {
       const detail = data?.error?.message;
-      throw new Error(`OpenRouter request failed (HTTP ${response.status})${detail ? `: ${String(detail).slice(0, 500)}` : ""}`);
+      const err = new Error(`OpenRouter request failed (HTTP ${response.status})${detail ? `: ${String(detail).slice(0, 500)}` : ""}`);
+      err.status = response.status;
+      throw err;
     }
     const answer = data?.choices?.[0]?.message?.content;
     if (typeof answer !== "string" || !answer.trim()) throw new Error("OpenRouter returned no answer.");
     const text = answer.trim();
     return text.length > 1900 ? text.slice(0, 1897) + "..." : text;
+  } catch (e) {
+    clearTimeout(timeout);
+    // If the primary model is overloaded, try a fallback model once
+    const FALLBACK_MODELS = ["google/gemma-3-27b-it:free", "meta-llama/llama-4-scout:free"];
+    if (!_retryModel && (/overload|429|502|503/i.test(String(e?.message || "")) || [429, 502, 503].includes(e?.status))) {
+      for (const fb of FALLBACK_MODELS) {
+        try {
+          logPretty("WARN", `OpenRouter ${model} overloaded; trying fallback ${fb}`);
+          return await askOpenRouter(question, history, persona, fb);
+        } catch { continue; }
+      }
+    }
+    throw e;
   } finally {
     clearTimeout(timeout);
   }
@@ -97,7 +113,7 @@ async function askGemini(question, history = [], persona = "") {
     if (config.openRouterApiKey) return askOpenRouter(question, history, persona);
     throw new Error("Gemini quota limit reached. Please try again after the cooldown.");
   }
-  const models = ["gemini-3.8-flash", "gemini-3.5-flash-lite"];
+  const models = ["gemini-flash-latest", "gemini-3.8-flash"];
   let geminiError = null;
   for (let i = 0; i < models.length; i++) {
     const controller = new AbortController();
@@ -140,13 +156,14 @@ async function askGemini(question, history = [], persona = "") {
         logPretty("WARN", `Gemini ${models[i]} unavailable (HTTP ${error.status}); trying ${models[i + 1]}`);
         continue;
       }
+      logPretty("WARN", `Gemini ${models[i]} failed with: ${error?.message || error}`);
       break;
     } finally {
       clearTimeout(timeout);
     }
   }
   if (config.openRouterApiKey) {
-    logPretty("WARN", `Gemini unavailable; falling back to OpenRouter (${config.openRouterModel})`);
+    logPretty("WARN", `Gemini unavailable (${geminiError?.message || geminiError}); falling back to OpenRouter (${config.openRouterModel})`);
     return askOpenRouter(question, history, persona);
   }
   throw geminiError || new Error("Gemini request failed. Please try again later.");
@@ -1148,19 +1165,68 @@ async function fetchLyrics(title) {
   if (lyricCache.has(key)) return lyricCache.get(key);
   const p = (async () => {
     try {
-      const q = encodeURIComponent(cleanTitle(title, 80));
+      // Aggressively clean the title for better LRCLIB search accuracy:
+      // 1. Strip hashtags (#fyp #edit etc.)
+      // 2. Strip emojis and special unicode
+      // 3. Strip common junk: (Official Video), [MV], (Lyrics), etc.
+      // 4. Strip "feat." / "ft." suffixes (often wrong match)
+      let cleaned = cleanTitle(title, 120);
+      cleaned = cleaned
+        .replace(/(#[^\s#]+\s*)+/g, "")                              // hashtags
+        .replace(/[\u{1F000}-\u{1FFFF}\u{2600}-\u{27BF}\u{FE00}-\u{FEFF}]/gu, "")  // emojis
+        .replace(/[\(\[\{][^)\]\}]*(official|video|mv|lyric|audio|remix|edit|visualizer|hd|hq|4k|full|ver|version|clip|short|tiktok|remaster)[^)\]\}]*[\)\]\}]/gi, "")
+        .replace(/\b(official\s*(music\s*)?video|lyrics?\s*video|audio|visualizer|short\s*ver)\b/gi, "")
+        .replace(/[「」『』【】《》\(\)\[\]]/g, " ")                      // brackets
+        .replace(/\s{2,}/g, " ")
+        .trim();
+      if (cleaned.length < 3) cleaned = cleanTitle(title, 80);       // fallback to less cleaning
+
+      const q = encodeURIComponent(cleaned);
       const s = await fetchJsonWithTimeout(`https://lrclib.net/api/search?q=${q}`, 7000);
       const arr = Array.isArray(s) ? s : [];
-      const best = arr.find((x) => x && x.syncedLyrics) || arr.find((x) => x && x.plainLyrics) || null;
-      if (!best) return null;
-      const synced = parseSyncedLyrics(best.syncedLyrics);
-      let text = String(best.plainLyrics || "").trim();
-      if (!text && best.syncedLyrics) text = String(best.syncedLyrics).replace(/^\[\d+:\d+\.\d+\]\s*/gm, "").trim();
+      if (!arr.length) return null;
+
+      // Validate: pick the result whose trackName is most similar to our query.
+      // This prevents returning lyrics for a completely different song.
+      const queryLower = cleaned.toLowerCase();
+      function similarity(a, b) {
+        const sa = String(a || "").toLowerCase(), sb = String(b || "").toLowerCase();
+        if (!sa || !sb) return 0;
+        // Check if one contains the other
+        if (sa.includes(sb) || sb.includes(sa)) return 0.8;
+        // Word overlap ratio
+        const wa = sa.split(/\s+/), wb = sb.split(/\s+/);
+        const common = wa.filter((w) => wb.some((w2) => w2.includes(w) || w.includes(w2))).length;
+        return common / Math.max(wa.length, wb.length);
+      }
+
+      // Score and sort results: prefer synced lyrics with high similarity
+      const scored = arr
+        .filter((x) => x && (x.syncedLyrics || x.plainLyrics))
+        .map((x) => ({
+          entry: x,
+          sim: Math.max(similarity(x.trackName, queryLower), similarity(x.artistName + " " + x.trackName, queryLower)),
+          hasSynced: !!x.syncedLyrics,
+        }))
+        .sort((a, b) => {
+          // Prefer high similarity, then synced lyrics
+          if (Math.abs(a.sim - b.sim) > 0.15) return b.sim - a.sim;
+          return (b.hasSynced ? 1 : 0) - (a.hasSynced ? 1 : 0);
+        });
+
+      // Reject if the best match is too dissimilar (likely wrong song)
+      const best = scored[0];
+      if (!best || best.sim < 0.25) return null;
+
+      const entry = best.entry;
+      const synced = parseSyncedLyrics(entry.syncedLyrics);
+      let text = String(entry.plainLyrics || "").trim();
+      if (!text && entry.syncedLyrics) text = String(entry.syncedLyrics).replace(/^\[\d+:\d+\.\d+\]\s*/gm, "").trim();
       if (!text) return null;
-      if (/^\[?instrumental\]?$/i.test(text)) return { text: "🎵 Instrumental", synced: [], artist: best.artistName || null, name: best.trackName || null };
+      if (/^\[?instrumental\]?$/i.test(text)) return { text: "🎵 Instrumental", synced: [], artist: entry.artistName || null, name: entry.trackName || null };
       if (text.length < 20) return null;
       if (text.length > 900) text = text.slice(0, 900).trim() + "…";
-      return { text, synced, artist: best.artistName || null, name: best.trackName || null };
+      return { text, synced, artist: entry.artistName || null, name: entry.trackName || null };
     } catch { return null; }
   })();
   lyricCache.set(key, p);
