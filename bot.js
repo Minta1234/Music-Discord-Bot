@@ -2,6 +2,7 @@
 require("dotenv").config();
 const path = require("path");
 const fs = require("fs");
+const os = require("os");
 const crypto = require("crypto");
 
 // --- Spotify link support (no direct Spotify audio streaming) ---
@@ -471,6 +472,9 @@ const {
   InviteTargetType,
   MessageFlags,
   ChannelType,
+  ModalBuilder,
+  TextInputBuilder,
+  TextInputStyle,
 } = require("discord.js");
 const {
   joinVoiceChannel,
@@ -787,24 +791,6 @@ function isGuildAdmin(member) {
     return member.permissions?.has?.(PermissionFlagsBits.ManageGuild);
   } catch { return false; }
 }
-function buildTransportRows(state = null) {
-  const paused = state?.player?.state?.status === AudioPlayerStatus.Paused;
-  const r1 = new ActionRowBuilder().addComponents(
-    new ButtonBuilder().setCustomId("mus_prev").setLabel("Prev").setEmoji("⏮").setStyle(ButtonStyle.Secondary),
-    new ButtonBuilder().setCustomId("mus_resume").setLabel(paused ? "Play" : "Pause").setEmoji(paused ? "▶" : "⏸").setStyle(paused ? ButtonStyle.Success : ButtonStyle.Secondary),
-    new ButtonBuilder().setCustomId("mus_skip").setLabel("Skip").setEmoji("⏭").setStyle(ButtonStyle.Primary),
-    new ButtonBuilder().setCustomId("mus_stop").setLabel("Stop").setEmoji("⏹").setStyle(ButtonStyle.Danger),
-    new ButtonBuilder().setCustomId("mus_queue").setLabel("List").setEmoji("📋").setStyle(ButtonStyle.Secondary),
-  );
-  const lyricsOn = state ? state.showLyrics !== false : true;
-  const r2 = new ActionRowBuilder().addComponents(
-    new ButtonBuilder().setCustomId("mus_loop").setLabel(`Loop: ${state ? loopLabel(state.loopMode).replace(/^[^\s]+\s/, "") : "Off"}`).setEmoji("🔁").setStyle(ButtonStyle.Secondary),
-    new ButtonBuilder().setCustomId("mus_lyrics").setLabel(`Lyrics: ${lyricsOn ? "On" : "Off"}`).setEmoji("📝").setStyle(ButtonStyle.Secondary),
-    new ButtonBuilder().setCustomId("mus_volup").setLabel("Vol +").setEmoji("🔊").setStyle(ButtonStyle.Secondary),
-    new ButtonBuilder().setCustomId("mus_voldown").setLabel("Vol −").setEmoji("🔉").setStyle(ButtonStyle.Secondary),
-  );
-  return [r1, r2];
-}
 // Setup is done once the guild has both bocchi rooms (text + saved voice).
 function isBocchiSetup(state) {
   const guild = state?.guildId ? client.guilds.cache.get(state.guildId) : null;
@@ -813,24 +799,41 @@ function isBocchiSetup(state) {
     c.type === ChannelType.GuildText && c.name.toLowerCase() === "bocchi");
   return hasText && !!getSavedMusicVoice(guild.id);
 }
-// Settings row: always visible so a hidden-controls panel can be reopened.
-// The /setup button hides itself once the bocchi rooms already exist.
-function buildSettingsRow(state = null) {
-  const shown = !state || state.showControls !== false;
-  const row = new ActionRowBuilder().addComponents(
-    new ButtonBuilder().setCustomId("mus_controls").setLabel(`Controls: ${shown ? "Show" : "Hidden"}`).setEmoji("🎛").setStyle(ButtonStyle.Secondary),
-  );
-  if (!isBocchiSetup(state)) {
-    row.addComponents(new ButtonBuilder().setCustomId("mus_setup").setLabel("/setup").setEmoji("🛠").setStyle(ButtonStyle.Secondary));
-  }
-  return row;
-}
 function buildControlRows(state = null) {
   const rows = [];
-  const [r1, r2] = buildTransportRows(state);
+  const paused = state?.player?.state?.status === AudioPlayerStatus.Paused;
+  const shown = !state || state.showControls !== false;
+
+  // Row 1: Minimal main controls
+  const r1 = new ActionRowBuilder().addComponents(
+    new ButtonBuilder().setCustomId("mus_resume").setEmoji(paused ? "▶" : "⏸").setStyle(paused ? ButtonStyle.Success : ButtonStyle.Secondary),
+    new ButtonBuilder().setCustomId("mus_skip").setEmoji("⏭").setStyle(ButtonStyle.Secondary),
+    new ButtonBuilder().setCustomId("mus_stop").setEmoji("⏹").setStyle(ButtonStyle.Danger),
+    new ButtonBuilder().setCustomId("mus_star").setEmoji("⭐").setStyle(ButtonStyle.Secondary),
+    new ButtonBuilder().setCustomId("mus_controls").setEmoji("🎛").setStyle(ButtonStyle.Secondary),
+  );
   rows.push(r1);
-  if (!state || state.showControls !== false) rows.push(r2);
-  rows.push(buildSettingsRow(state));
+
+  // Row 2: Extra controls (hidden by default if minimal is requested, toggled by 🎛)
+  if (shown) {
+    const lyricsOn = state ? state.showLyrics !== false : true;
+    const r2 = new ActionRowBuilder().addComponents(
+      new ButtonBuilder().setCustomId("mus_prev").setLabel("Prev").setEmoji("⏮").setStyle(ButtonStyle.Secondary),
+      new ButtonBuilder().setCustomId("mus_queue").setLabel("List").setEmoji("📋").setStyle(ButtonStyle.Secondary),
+      new ButtonBuilder().setCustomId("mus_loop").setLabel(`Loop: ${state ? loopLabel(state.loopMode).replace(/^[^\s]+\s/, "") : "Off"}`).setEmoji("🔁").setStyle(ButtonStyle.Secondary),
+      new ButtonBuilder().setCustomId("mus_lyrics").setLabel(`Lyrics: ${lyricsOn ? "On" : "Off"}`).setEmoji("📝").setStyle(ButtonStyle.Secondary),
+      new ButtonBuilder().setCustomId("mus_batchplay").setLabel("Batch").setEmoji("📥").setStyle(ButtonStyle.Success),
+    );
+    rows.push(r2);
+  }
+
+  // Row 3: Setup (only if not setup yet)
+  if (!isBocchiSetup(state)) {
+    rows.push(new ActionRowBuilder().addComponents(
+      new ButtonBuilder().setCustomId("mus_setup").setLabel("/setup").setEmoji("🛠").setStyle(ButtonStyle.Secondary)
+    ));
+  }
+  
   return rows;
 }
 function buildPanelEmbed(guild) {
@@ -974,6 +977,21 @@ async function handleMusicButton(itx) {
   }
   if (id === "mus_volup") { setVolumePct(state, (state.volumePct || 100) + 20); return itx.reply({ content: `🔊 ${state.volumePct}%`, flags: MessageFlags.Ephemeral }); }
   if (id === "mus_voldown") { setVolumePct(state, Math.max(0, (state.volumePct || 100) - 20)); return itx.reply({ content: `🔉 ${state.volumePct}%`, flags: MessageFlags.Ephemeral }); }
+  if (id === "mus_star") { return itx.reply({ content: "⭐ Saved to favorites! (Note: feature in development)", flags: MessageFlags.Ephemeral }); }
+  if (id === "mus_batchplay") {
+    const modal = new ModalBuilder()
+      .setCustomId("batch_play_modal")
+      .setTitle("📥 Batch Play — Add Multiple Songs");
+    const linksInput = new TextInputBuilder()
+      .setCustomId("batch_play_links")
+      .setLabel("Paste song links / names (one per line)")
+      .setStyle(TextInputStyle.Paragraph)
+      .setPlaceholder("https://youtube.com/watch?v=...\nhttps://open.spotify.com/track/...\nNever Gonna Give You Up\n...")
+      .setRequired(true)
+      .setMaxLength(4000);
+    modal.addComponents(new ActionRowBuilder().addComponents(linksInput));
+    return itx.showModal(modal);
+  }
   return itx.reply({ content: "?", flags: MessageFlags.Ephemeral });
 }
 
@@ -987,6 +1005,7 @@ function buildHelpEmbedSlash() {
         name: "🎶 Play & queue",
         value: [
           "`/play query:<name/URL>` — Play or queue a song",
+          "`/batchplay` — Open a form to add multiple songs at once",
           "`/playlist query:<URL/search> limit:<N>` — Load songs in bulk",
           "`/queue` — Show the full queue",
           "`/p` — Currently playing song",
@@ -1114,6 +1133,16 @@ function fmtTime(sec) {
   return `${m}:${String(s).padStart(2, "0")}`;
 }
 function playbackSeconds(state) {
+  // Prefer the player's own count of rendered audio: it advances exactly 20ms
+  // per opus frame actually played, so it never drifts. Wall-clock
+  // (Date.now() - startedAt) keeps running during network stalls/rebuffers
+  // while the audio is frozen, which slides the karaoke highlight out of sync.
+  const res = state.currentResource || state.player?.state?.resource;
+  const playedMs = Number(res?.playbackDuration);
+  if (res && Number.isFinite(playedMs) && playedMs >= 0) {
+    return (state.posBase || 0) + playedMs / 1000;
+  }
+  // Fallback before a resource exists (e.g. still buffering): wall-clock.
   const isPaused = state.player?.state?.status === AudioPlayerStatus.Paused && state.pausedAt;
   const referenceTime = isPaused ? state.pausedAt : Date.now();
   const elapsed = state.startedAt ? (referenceTime - state.startedAt) / 1000 : 0;
@@ -1136,6 +1165,104 @@ function progressLine(state) {
 }
 // Lyrics via LRCLIB (free, no key). Cached per title. Returns plain text plus
 // timestamped `synced` lines for karaoke scrolling, or null when missing.
+//
+// YouTube subtitle fetch: grab auto-generated captions from the video itself.
+// These are perfectly synced to the video timing (unlike LRCLIB which uses album timing).
+const ytSubCache = new Map();
+async function fetchYouTubeLyrics(videoUrl) {
+  if (!videoUrl) return null;
+  // Plain-text request (played by song name)? Resolve the same top video the
+  // playback pipe would pick, so subtitles belong to the song actually playing.
+  if (!isUrl(videoUrl)) {
+    const resolved = await resolveFirstVideoUrl(videoUrl).catch(() => null);
+    if (!resolved) return null;
+    videoUrl = resolved;
+  }
+  const id = extractYouTubeIdSafe(videoUrl);
+  if (!id) return null;
+  if (ytSubCache.has(id)) return ytSubCache.get(id);
+  const p = (async () => {
+    try {
+      const tmpFile = path.join(os.tmpdir(), `ytsub_${id}`);
+      // Prefer English, then Japanese (many songs are JP), then any original-language track.
+      await new Promise((resolve, reject) => {
+        const args = [
+          "--write-auto-sub", "--write-sub", "--sub-langs", "en.*,ja.*,original",
+          "--skip-download", "--no-warnings",
+          "-o", tmpFile, videoUrl
+        ];
+        const proc = spawn(YTDLP_BIN, args, { stdio: ["ignore", "pipe", "pipe"] });
+        let stderr = "";
+        proc.stderr.on("data", d => stderr += d.toString());
+        proc.on("close", code => code === 0 ? resolve() : reject(new Error(stderr.slice(0, 200))));
+        setTimeout(() => { try { proc.kill(); } catch {} reject(new Error("timeout")); }, 60000);
+      });
+      // yt-dlp names the file <tmp>.<lang>.vtt — pick by preference, then clean up all.
+      const dir = path.dirname(tmpFile);
+      const base = path.basename(tmpFile);
+      const candidates = fs.readdirSync(dir).filter((f) => f.startsWith(base) && f.endsWith(".vtt"));
+      if (!candidates.length) return null;
+      const rank = (f) => (/\.en[.-]/.test(f) ? 0 : /\.ja[.-]/.test(f) ? 1 : 2);
+      candidates.sort((a, b) => rank(a) - rank(b));
+      const vttPath = path.join(dir, candidates[0]);
+      const vtt = fs.readFileSync(vttPath, "utf8");
+      for (const f of candidates) { try { fs.unlinkSync(path.join(dir, f)); } catch {} }
+      const synced = parseVttLyrics(vtt);
+      if (synced.length < 3) return null;
+      const plainText = synced.map(s => s.text).join("\n");
+      return { text: plainText, synced, artist: null, name: null, fromYouTube: true };
+    } catch { return null; }
+  })();
+  ytSubCache.set(id, p);
+  if (ytSubCache.size > 100) { try { ytSubCache.delete(ytSubCache.keys().next().value); } catch {} }
+  return p;
+}
+// Parse a WebVTT caption file into synced lyric lines. Handles CRLF, missing
+// hour component, inline tags, ♪ markers and sound effects.
+function parseVttLyrics(vtt) {
+  const synced = [];
+  const seen = new Set();
+  const normalized = String(vtt).replace(/\r\n?/g, "\n");
+  for (const block of normalized.split(/\n{2,}/)) {
+    const m = block.match(/(?:(\d{1,2}):)?(\d{1,2}):(\d{2}(?:[.,]\d+)?)\s*-->/);
+    if (!m) continue;
+    const t = (Number(m[1] || 0) * 3600) + (Number(m[2]) * 60) + Number(String(m[3]).replace(",", "."));
+    const lines = block.split("\n")
+      .filter((l) => !l.includes("-->") && !/^\d+$/.test(l.trim()) && !/^WEBVTT/.test(l) && !/^Kind:/.test(l) && !/^Language:/.test(l) && !/^NOTE/.test(l) && !/^STYLE/.test(l))
+      .map((l) => l.replace(/<[^>]+>/g, "").trim())
+      .filter(Boolean);
+    let text = lines.join(" ").trim();
+    if (/^\([^)]*\)$/.test(text) || /^\[[^\]]*\]$/.test(text)) continue;
+    text = text.replace(/♪\s*/g, "").replace(/\s*♪/g, "").trim();
+    if (!text || text.length < 2) continue;
+    const key = text.toLowerCase();
+    if (seen.has(key)) continue;
+    seen.clear();
+    seen.add(key);
+    synced.push({ t, text: text.slice(0, 160) });
+  }
+  synced.sort((a, b) => a.t - b.t);
+  return synced;
+}
+// One yt-dlp metadata pass for link plays: real title, exact duration and the
+// resolved video URL. The URL then feeds the (proven) subtitle downloader, and
+// the duration lets LRCLIB pick the right version — so lyrics match the song
+// and its timing without any manual offset.
+async function resolveVideoMeta(url) {
+  const out = { title: null, durationSec: null, videoUrl: null };
+  try {
+    const info = await ytdlp(url, ytdlpOpts({ dumpSingleJson: true, skipDownload: true, noWarnings: true }));
+    const e = info?.entries?.[0] || info;
+    if (e) {
+      out.title = e.title || null;
+      out.durationSec = numOrNull(e.duration);
+      out.videoUrl = e.webpage_url || (isUrl(url) ? url : null);
+    }
+  } catch (e) {
+    logPretty("WARN", `video meta resolve failed: ${e?.message || e}`);
+  }
+  return out;
+}
 const lyricCache = new Map();
 function parseSyncedLyrics(synced) {
   const out = [];
@@ -1159,9 +1286,10 @@ function lyricIndexAt(synced, elapsedSec) {
   }
   return idx;
 }
-async function fetchLyrics(title) {
+async function fetchLyrics(title, durationSec = null) {
   const key = String(title || "").slice(0, 80).toLowerCase().trim();
   if (!key || key.length < 3) return null;
+  if (isUrl(title)) return null; // never search LRCLIB with a raw link
   if (lyricCache.has(key)) return lyricCache.get(key);
   const p = (async () => {
     try {
@@ -1200,19 +1328,24 @@ async function fetchLyrics(title) {
         return common / Math.max(wa.length, wb.length);
       }
 
-      // Score and sort results: prefer synced lyrics with high similarity
+      // Score and sort results: prefer synced lyrics, high similarity, and a
+      // duration close to the played video (rejects wrong versions/covers).
+      const wantDur = Number.isFinite(Number(durationSec)) && Number(durationSec) > 0 ? Number(durationSec) : null;
       const scored = arr
         .filter((x) => x && (x.syncedLyrics || x.plainLyrics))
-        .map((x) => ({
-          entry: x,
-          sim: Math.max(similarity(x.trackName, queryLower), similarity(x.artistName + " " + x.trackName, queryLower)),
-          hasSynced: !!x.syncedLyrics,
-        }))
-        .sort((a, b) => {
-          // Prefer high similarity, then synced lyrics
-          if (Math.abs(a.sim - b.sim) > 0.15) return b.sim - a.sim;
-          return (b.hasSynced ? 1 : 0) - (a.hasSynced ? 1 : 0);
-        });
+        .map((x) => {
+          const sim = Math.max(similarity(x.trackName, queryLower), similarity(x.artistName + " " + x.trackName, queryLower));
+          const d = Number(x.duration);
+          const durDiff = wantDur && Number.isFinite(d) && d > 0 ? Math.abs(d - wantDur) : null;
+          let score = sim + (x.syncedLyrics ? 0.1 : 0);
+          if (durDiff !== null) {
+            if (durDiff <= 8) score += 0.35;          // same version
+            else if (durDiff <= 30) score += 0.1;      // close (maybe different master)
+            else score -= 0.5;                          // wrong version (live/cover/edit)
+          }
+          return { entry: x, sim, score, hasSynced: !!x.syncedLyrics };
+        })
+        .sort((a, b) => b.score - a.score || (b.hasSynced ? 1 : 0) - (a.hasSynced ? 1 : 0));
 
       // Reject if the best match is too dissimilar (likely wrong song)
       const best = scored[0];
@@ -1237,7 +1370,7 @@ async function fetchLyrics(title) {
 // position — sung lines dimmed, the live line highlighted, upcoming lines plain.
 // Driven by track position so the window auto-scrolls as the song plays.
 function karaokeField(state, lyrics, estimated = false) {
-  const el = playbackSeconds(state);
+  const el = playbackSeconds(state) - (state.lyricOffset || 0);
   const synced = lyrics.synced;
   const idx = lyricIndexAt(synced, el);
   const PAST = 2, FUTURE = 4;
@@ -1246,17 +1379,25 @@ function karaokeField(state, lyrics, estimated = false) {
     rows.push("*♪ Intro — get ready…*");
     for (let i = 0; i < Math.min(FUTURE + 1, synced.length); i++) rows.push(`　${synced[i].text}`);
   } else {
+    const isInstrumental = (idx < synced.length - 1) && (el > synced[idx].t + 4) && (synced[idx + 1].t > el + 4);
     const start = Math.max(0, idx - PAST);
-    for (let i = start; i < idx; i++) rows.push(`╰╴${synced[i].text}`);
-    rows.push(`**🎤▶ ${synced[idx].text}**`);
+    for (let i = start; i <= idx; i++) {
+      if (i === idx && !isInstrumental) break;
+      rows.push(`╰─ ${synced[i].text}`);
+    }
+    if (isInstrumental) {
+      rows.push(`**🎶▶ *♪ Instrumental…***`);
+    } else {
+      rows.push(`**🎶▶ ${synced[idx].text}**`);
+    }
     for (let i = idx + 1; i < synced.length && rows.length < PAST + 1 + FUTURE; i++) rows.push(`　${synced[i].text}`);
-    if (idx >= synced.length - 1) rows.push("*♪ Outro…*");
+    if (idx >= synced.length - 1 && !isInstrumental) rows.push("*♪ Outro…*");
   }
   let value = rows.join("\n");
   if (value.length > 1000) value = value.slice(0, 997).trimEnd() + "…";
   const by = lyrics.artist ? ` · ${lyrics.artist}` : "";
   const est = estimated ? " · ~timing estimated" : "";
-  return { name: `🎤 Karaoke — sing along${by}${est}`, value: `​\n${value}\n​`, inline: false };
+  return { name: `🎶🎤Karaoke — sing along${by}${est}`, value: `​\n${value}\n​`, inline: false };
 }
 // No synced LRC available? Spread the plain lines evenly over the track so the
 // karaoke highlight still scrolls (clearly labelled as estimated).
@@ -1500,7 +1641,7 @@ async function runDmMusicCommand(msg, guild, cmd, parts) {
   }
   if (cmd === "np") {
     if (!state.current) return reply({ embeds: [infoEmbed("🎵 Nothing playing", `Use \`/play\` to start`)] });
-    const lyrNp = await fetchLyrics(state.current.title).catch(() => null);
+    const lyrNp = state.currentLyrics || await fetchLyrics(state.current.title).catch(() => null);
     return reply({ embeds: [buildNowPlayingEmbed(state, lyrNp)] });
   }
   if (cmd === "queue") {
@@ -1531,6 +1672,7 @@ async function runDmMusicCommand(msg, guild, cmd, parts) {
     if (meta.title && meta.title !== q) item.title = meta.title;
     if (meta.thumb) item.thumb = meta.thumb;
     if (meta.durationSec) item.durationSec = meta.durationSec;
+    if (meta.videoUrl) item.videoUrl = meta.videoUrl;
     const addedEmbed = makeEmbed(COLORS.success).setDescription(`### ➕ Added to queue`)
       .addFields(
         { name: "🎵 Track", value: `**${cleanTitle(item.title)}**`, inline: false },
@@ -1702,6 +1844,8 @@ client.on("messageCreate", async (msg) => {
 const commands = [
   new SlashCommandBuilder().setName("play").setDescription("Play music from YouTube (song name or URL)")
     .addStringOption(o => o.setName("query").setDescription("Song name/URL").setRequired(true)),
+  new SlashCommandBuilder().setName("lyricoffset").setDescription("Shift lyrics timing forwards or backwards (e.g. for music videos with long intros)")
+    .addNumberOption(o => o.setName("seconds").setDescription("Seconds to shift (e.g. 15 or -5)").setRequired(true)),
   new SlashCommandBuilder().setName("skip").setDescription("Skip the current song"),
   new SlashCommandBuilder().setName("stop").setDescription("Stop and clear the queue"),
   new SlashCommandBuilder().setName("pause").setDescription("Pause"),
@@ -1756,6 +1900,7 @@ const commands = [
     .addStringOption(o => o.setName("query").setDescription("Video name/YouTube URL").setRequired(true)),
   new SlashCommandBuilder().setName("watchtogether").setDescription("Watch video together in voice chat (Watch Together)"),
   new SlashCommandBuilder().setName("vstate").setDescription("Debug: voice/player status (admin)"),
+  new SlashCommandBuilder().setName("batchplay").setDescription("Add multiple songs at once (opens a form to paste links)"),
 ].map(c => c.toJSON());
 
 // Guild queue and player state
@@ -1940,6 +2085,8 @@ function createGuildState(guild) {
     } else if (oldS.status === AudioPlayerStatus.Paused && newS.status === AudioPlayerStatus.Playing) {
       if (state.startedAt && state.pausedAt) state.startedAt += Date.now() - state.pausedAt;
       state.pausedAt = null;
+    } else if (oldS.status === AudioPlayerStatus.Buffering && newS.status === AudioPlayerStatus.Playing) {
+      state.startedAt = Date.now();
     }
     if (state.current && state.npMessage && [AudioPlayerStatus.Playing, AudioPlayerStatus.Paused].includes(newS.status)) {
       const channelId = getSavedControlChannel(guild.id) || state.current.textChannelId;
@@ -2085,7 +2232,7 @@ async function resolveTitleAndThumb(input) {
     const e = info?.entries?.[0] || info;
     if (e?.title) {
       const url = e.webpage_url || input;
-      return { title: e.title, thumb: pickThumb(e, url) || thumbFor(input), durationSec: numOrNull(e.duration) };
+      return { title: e.title, thumb: pickThumb(e, url) || thumbFor(input), durationSec: numOrNull(e.duration), videoUrl: e.webpage_url || null };
     }
   } catch { }
   return { title: input, thumb: thumbFor(input), durationSec: null };
@@ -2763,14 +2910,38 @@ async function playNext(guild, textChannelId, state = getGuildState(guild)) {
   state.pausedAt = null;
 
   try {
-    // Lyrics resolve in parallel with audio extraction — no added delay.
-    const lyrP = fetchLyrics(next.title).catch(() => null);
+    // LRCLIB fetch runs in parallel (uses album timing, fast).
+    let lyrP = fetchLyrics(next.title, next.durationSec).catch(() => null);
+    const oldTitle = next.title;
     // Use unified playback helper; this will throw on resolution errors.
-    // stayPut: automatic queue advances never move rooms. Fresh /play-style
-    // requests already validated same-room-or-no-connection, so staying is safe.
     const { pageUrl } = await startPlayback(guild, next, state, true);
     if (stale()) return; // a newer playback took over — don't touch state
-    state.startedAt = Date.now();
+
+    // Link plays start with title = the URL; wait briefly for the parallel
+    // metadata resolve (audio is already playing, so this delays nothing).
+    if (isUrl(next.title) || next.title === oldTitle && isUrl(oldTitle)) {
+      for (let i = 0; i < 16 && (isUrl(next.title) || !next.durationSec); i++) {
+        await new Promise((r) => setTimeout(r, 500));
+        if (stale()) return;
+      }
+      // Metadata still missing? One direct probe gives title + duration + URL.
+      if (isUrl(next.title) || !next.durationSec) {
+        const probeTarget = isUrl(next.title) ? next.title : next.source;
+        if (isUrl(probeTarget)) {
+          const meta = await resolveVideoMeta(probeTarget);
+          if (stale()) return;
+          if (meta.title && isUrl(next.title)) next.title = meta.title;
+          if (!next.durationSec && meta.durationSec) next.durationSec = meta.durationSec;
+          if (!next.videoUrl && meta.videoUrl) next.videoUrl = meta.videoUrl;
+        }
+      }
+    }
+    // Refetch with the real title + duration so LRCLIB picks the right version.
+    if (next.title !== oldTitle || next.durationSec) {
+      lyrP = fetchLyrics(next.title, next.durationSec).catch(() => null);
+    }
+    
+    // startedAt is set by the stateChange handler (buffering→playing)
     state.pausedAt = null;
     state.lastStart = { title: next.title, t: Date.now() };
     state.failStreak = 0;
@@ -2778,12 +2949,27 @@ async function playNext(guild, textChannelId, state = getGuildState(guild)) {
       user:  next.requestedBy,
       tail: `up_next: ${state.queue[0]?.title || "—"}`,
     });
-    const lyrics = await lyrP;
+    
+    // Use LRCLIB as immediate baseline
+    const lrcLib = await lyrP;
     if (stale()) return;
-    state.currentLyrics = lyrics;
+    state.currentLyrics = lrcLib;
     const controlChannelId = getSavedControlChannel(guild.id) || next.textChannelId;
-    await upsertNpMessage(guild, controlChannelId, buildNowPlayingEmbed(state, lyrics));
+    await upsertNpMessage(guild, controlChannelId, buildNowPlayingEmbed(state, lrcLib));
     startNowPlayingTicker(guild, state);
+
+    // YouTube subtitle fetch: perfectly synced to the video timing.
+    // This can take 30-40s if YouTube throttles yt-dlp, so we run it completely
+    // asynchronously in the background without blocking the song from starting!
+    fetchYouTubeLyrics(next.videoUrl || next.source).then(async (ytSub) => {
+      if (stale() || state.current !== next) return; // Song changed while downloading
+      if (ytSub && ytSub.synced?.length) {
+        logPretty("INFO", "YouTube subtitles arrived (video-synced), swapping lyrics");
+        state.currentLyrics = ytSub;
+        await refreshNpControls(guild, state);
+      }
+    }).catch(() => null);
+
   } catch (e) {
     if (stale()) { // put the song back — the newer flow owns the queue now
       try { if (state.current !== next && next) state.queue.unshift(next); } catch {}
@@ -2854,12 +3040,24 @@ async function playSame(guild, textChannelId, item, state = getGuildState(guild)
     state.pausedAt = null;
     state.lastStart = { title: item.title, t: Date.now() };
     logPretty("WARN", `RESTARTED  ${item.title}`);
-    const lyrRe = await fetchLyrics(item.title).catch(() => null);
+    // Keep YouTube-synced lyrics across loop/speed/seek restarts; only refetch when missing.
+    let lyrRe = (state.currentLyrics?.fromYouTube && Array.isArray(state.currentLyrics.synced) && state.currentLyrics.synced.length)
+      ? state.currentLyrics
+      : await fetchLyrics(item.title).catch(() => null);
     if (stale()) return;
     state.currentLyrics = lyrRe;
     const controlChannelId = getSavedControlChannel(guild.id) || textChannelId;
     await upsertNpMessage(guild, controlChannelId, buildNowPlayingEmbed(state, lyrRe));
     startNowPlayingTicker(guild, state);
+    if (!lyrRe?.fromYouTube) {
+      fetchYouTubeLyrics(item.videoUrl || item.source).then(async (ytSub) => {
+        if (stale() || state.current !== item) return;
+        if (ytSub && ytSub.synced?.length) {
+          state.currentLyrics = ytSub;
+          await refreshNpControls(guild, state);
+        }
+      }).catch(() => null);
+    }
   } catch (err) {
     const msg = String(err?.message || err || "");
     logPretty("ERROR", "playSame error: " + msg);
@@ -3018,6 +3216,18 @@ client.once(Events.ClientReady, async () => {
     const ONE_DAY = 24 * 3600 * 1000;
     if (Date.now() - readLastUpdateTs() > ONE_DAY) runYtDlpUpdate();
   }
+
+  // Broadcast "Server Started" to all #bocchi channels
+  for (const guild of client.guilds.cache.values()) {
+    const bocchiChannel = guild.channels.cache.find(c => c.type === ChannelType.GuildText && c.name.toLowerCase() === "bocchi");
+    if (bocchiChannel) {
+      const embed = makeEmbed(COLORS.success)
+        .setTitle("✅ Bot Started")
+        .setDescription("I am now online and ready to play music!")
+        .setTimestamp();
+      bocchiChannel.send({ embeds: [embed] }).catch(() => {});
+    }
+  }
 });
 
 client.on("interactionCreate", async (itx) => {
@@ -3043,6 +3253,61 @@ client.on("interactionCreate", async (itx) => {
       if (String(itx.customId || "").startsWith("mus_")) return await handleMusicButton(itx);
     } catch (e) { try { await itx.reply({ content: "Error: " + (e?.message || e), flags: MessageFlags.Ephemeral }); } catch { } return; }
     return;
+  }
+  // --- Batch Play modal submission handler ---
+  if (itx.isModalSubmit && itx.isModalSubmit() && itx.customId === "batch_play_modal") {
+    try {
+      await itx.deferReply({ flags: MessageFlags.Ephemeral });
+      const raw = itx.fields.getTextInputValue("batch_play_links");
+      const lines = raw.split(/\r?\n/).map(l => l.trim()).filter(l => l.length > 0);
+      if (!lines.length) return itx.editReply({ embeds: [errorEmbed("No links or song names provided")] });
+      const guild = itx.guild;
+      const state = getGuildState(guild);
+      const userVC = itx.member?.voice?.channelId;
+      if (!userVC) return itx.editReply({ embeds: [errorEmbed("Please join a voice channel first 🎙️")] });
+      const shouldStart = !state.current;
+      const metaPromises = [];
+      for (const line of lines) {
+        const item = {
+          title: line,
+          source: line,
+          requestedBy: itx.user.tag,
+          guild,
+          voiceChannelId: userVC,
+          textChannelId: itx.channelId,
+        };
+        state.queue.push(item);
+        // Resolve real titles in the background
+        metaPromises.push(
+          resolveTitleAndThumb(line).then(meta => {
+            if (meta.title && meta.title !== line) item.title = meta.title;
+            if (meta.thumb) item.thumb = meta.thumb;
+            if (meta.durationSec) item.durationSec = meta.durationSec;
+            if (meta.videoUrl) item.videoUrl = meta.videoUrl;
+          }).catch(() => {})
+        );
+      }
+      if (shouldStart) playNext(guild, itx.channelId, state);
+      // Wait for metadata in background, then reply
+      await Promise.allSettled(metaPromises);
+      const preview = lines.slice(0, 8).map((l, i) => {
+        const item = state.queue.find(q => q.source === l);
+        const title = item ? cleanTitle(item.title) : l;
+        return `\`${i + 1}.\` ${title.length > 60 ? title.slice(0, 57) + "..." : title}`;
+      }).join("\n");
+      const more = lines.length > 8 ? `\n*… and **${lines.length - 8}** more*` : "";
+      const batchEmbed = makeEmbed(COLORS.success)
+        .setDescription(`### 📥 Batch Play — ${lines.length} track${lines.length > 1 ? "s" : ""} added`)
+        .addFields(
+          { name: "🎶 Tracks", value: `${preview}${more}`, inline: false },
+          { name: "👤 Requested by", value: `${itx.user}`, inline: true },
+          { name: "📋 Queue size", value: `\`${state.queue.length}\``, inline: true },
+        );
+      return itx.editReply({ embeds: [batchEmbed] });
+    } catch (e) {
+      try { await itx.editReply({ content: "Batch play error: " + (e?.message || e) }); } catch { }
+      return;
+    }
   }
   if (!itx.isChatInputCommand()) return;
   // Calculate round-trip time. Clamp at zero to avoid negative values when clocks differ.
@@ -3223,7 +3488,7 @@ client.on("interactionCreate", async (itx) => {
   const botVC = me?.voice?.channelId;
   const sameVC = userVC && (!botVC || botVC === userVC);
 
-  const needsSameVC = !["help", "ai", "ping", "botupdate", "np", "queue", "panel", "ytstatus", "ytsignin", "ytsignout", "watchtogether", "vstate"].includes(itx.commandName);
+  const needsSameVC = !["help", "ai", "ping", "botupdate", "np", "queue", "panel", "ytstatus", "ytsignin", "ytsignout", "watchtogether", "vstate", "batchplay"].includes(itx.commandName);
 
   if (needsSameVC && !sameVC) {
     return itx.reply({ embeds: [errorEmbed("Please join the bot's voice channel first 🎙️")], flags: MessageFlags.Ephemeral });
@@ -3365,6 +3630,7 @@ client.on("interactionCreate", async (itx) => {
     if (meta.title && meta.title !== q) item.title = meta.title;
     if (meta.thumb) item.thumb = meta.thumb;
     if (meta.durationSec) item.durationSec = meta.durationSec;
+    if (meta.videoUrl) item.videoUrl = meta.videoUrl;
     const addedSlash = makeEmbed(COLORS.success)
       .setDescription(`### ➕ Added to queue`)
       .addFields(
@@ -3415,7 +3681,7 @@ client.on("interactionCreate", async (itx) => {
 
   if (itx.commandName === "np" || itx.commandName === "p") {
     if (!state.current) return itx.reply({ embeds: [infoEmbed("🎵 Nothing playing", "Use `/play query:<song>` to start")] });
-    const lyrNpS = await fetchLyrics(state.current.title).catch(() => null);
+    const lyrNpS = state.currentLyrics || await fetchLyrics(state.current.title).catch(() => null);
     return itx.reply({ embeds: [buildNowPlayingEmbed(state, lyrNpS)], components: buildControlRows(state) });
   }
 
@@ -3442,6 +3708,30 @@ client.on("interactionCreate", async (itx) => {
     setVolumePct(state, v);
     const bar = "█".repeat(Math.round(Math.min(state.volumePct, 200) / 20)) + "░".repeat(10 - Math.round(Math.min(state.volumePct, 200) / 20));
     return itx.reply({ embeds: [successEmbed("🔊  Volume updated", `\`${bar}\` **${state.volumePct}%**`)] });
+  }
+
+  if (itx.commandName === "lyricoffset") {
+    const sec = itx.options.getNumber("seconds");
+    state.lyricOffset = sec;
+    return itx.reply({ embeds: [successEmbed("⏱️ Lyrics Offset", `Lyrics have been shifted by **${sec > 0 ? "+" : ""}${sec}s** for this session.`)], flags: MessageFlags.Ephemeral });
+  }
+
+  // --- /batchplay: open a modal form to paste multiple links ---
+  if (itx.commandName === "batchplay") {
+    const userVCBatch = itx.member?.voice?.channelId;
+    if (!userVCBatch) return itx.reply({ embeds: [errorEmbed("Please join a voice channel first 🎙️")], flags: MessageFlags.Ephemeral });
+    const modal = new ModalBuilder()
+      .setCustomId("batch_play_modal")
+      .setTitle("📥 Batch Play — Add Multiple Songs");
+    const linksInput = new TextInputBuilder()
+      .setCustomId("batch_play_links")
+      .setLabel("Paste song links / names (one per line)")
+      .setStyle(TextInputStyle.Paragraph)
+      .setPlaceholder("https://youtube.com/watch?v=...\nhttps://open.spotify.com/track/...\nNever Gonna Give You Up\n...")
+      .setRequired(true)
+      .setMaxLength(4000);
+    modal.addComponents(new ActionRowBuilder().addComponents(linksInput));
+    return itx.showModal(modal);
   }
 
   if (itx.commandName === "playlist") {
@@ -3645,7 +3935,7 @@ function dashGuilds() {
         id, name: g.name,
         botVC: g.members.me?.voice?.channelId || null,
         voice,
-        nowPlaying: st?.current ? { title: st.current.title, by: st.current.requestedBy, thumb: st.current.thumb || thumbFor(st.current.source), durationSec: st.current.durationSec || null, startedAt: st.startedAt || null, posBase: st.posBase || 0, lyrics: st.currentLyrics } : null,
+        nowPlaying: st?.current ? { title: st.current.title, by: st.current.requestedBy, thumb: st.current.thumb || thumbFor(st.current.source), durationSec: st.current.durationSec || null, startedAt: st.startedAt || null, posBase: st.posBase || 0, positionSec: playbackSeconds(st), lyrics: st.currentLyrics } : null,
         queue: st ? st.queue.slice(0, 20).map((x) => ({ title: x.title, by: x.requestedBy })) : [],
         queueCount: st?.queue.length || 0,
         volume: st?.volumePct ?? config.defaultVolume,
@@ -3686,6 +3976,7 @@ async function dashPlay(guildId, query) {
   if (meta.title && meta.title !== q) item.title = meta.title;
   if (meta.thumb) item.thumb = meta.thumb;
   if (meta.durationSec) item.durationSec = meta.durationSec;
+  if (meta.videoUrl) item.videoUrl = meta.videoUrl;
   logPretty("COMMAND", "WEB /play", { user: "dashboard", guild: guild.name, tail: item.title });
   return { title: item.title, position: state.queue.length };
 }
@@ -4056,8 +4347,8 @@ function dashPlayerPageTailwind() {
   + '};'
   + 'async function refresh(){if(!gid())return;try{PG.g=await(await fetch("/api/guilds")).json();PG.snap=cur();PG.snapAt=Date.now();paint();}catch(e){}}'
   + 'function paint(){var g=PG.snap;if(!g)return;var n=g.nowPlaying;document.getElementById("ttl").textContent=n?n.title:"\u2014 idle \u2014";document.getElementById("by").textContent=n?"Requested by "+n.by:"Choose a server and queue a track.";var c=document.getElementById("cover");var ph=document.getElementById("cover-ph");if(n&&n.thumb){c.classList.remove("hidden");ph.classList.add("hidden");if(c.getAttribute("src")!==n.thumb)c.src=n.thumb;}else{c.classList.add("hidden");ph.classList.remove("hidden");}'
-  + 'var lc=document.getElementById("lyrics-container");if(n&&n.lyrics&&n.lyrics.synced&&n.lyrics.synced.length){lc.classList.remove("hidden");if(lc.dataset.title!==n.title){lc.innerHTML="";lc.dataset.title=n.title;n.lyrics.synced.forEach(function(l){var p=document.createElement("p");p.className="lyric-line transition-all duration-300";p.dataset.time=l.t;p.textContent=l.text||"♪";lc.appendChild(p);});}var sp=n.speed||1;var base=n.posBase||0;var t0=n.startedAt||PG.snapAt;var el=base+Math.max(0,(Date.now()-t0)/1000)*sp;var lines=Array.from(lc.children);var aIdx=-1;for(var i=0;i<lines.length;i++){if(parseFloat(lines[i].dataset.time)<=el)aIdx=i;else break;}lines.forEach(function(p,i){if(i===aIdx){if(!p.classList.contains("active")){p.classList.add("active");p.style.color="#fcd34d";p.style.transform="scale(1.1)";lc.scrollTop=p.offsetTop-lc.offsetTop-(lc.clientHeight/2)+(p.clientHeight/2);}}else{p.classList.remove("active");p.style.color="";p.style.transform="";}});}else{lc.classList.add("hidden");lc.dataset.title="";}'
-  + 'var dur=n&&n.durationSec?n.durationSec:null;var spp=(n&&n.speed)||1;var bs=(n&&n.posBase)||0;var t0b=(n&&n.startedAt)?n.startedAt:PG.snapAt;var elb=bs+Math.max(0,(Date.now()-t0b)/1000)*spp;document.getElementById("tcur").textContent=fmtT(elb);if(dur){document.getElementById("tdur").textContent=fmtT(dur);var pct=Math.max(0,Math.min(100,elb/dur*100));document.getElementById("tfill").style.width=pct+"%";document.getElementById("timebar").title="Click to seek";}else{document.getElementById("tdur").innerHTML="<span id=\'live-dot\' style=\'display:inline-block;width:8px;height:8px;border-radius:50%;background:#fcd34d;margin-right:4px;animation:live-pulse 1.5s ease-in-out infinite\'></span>LIVE";document.getElementById("tfill").style.width="100%";document.getElementById("tfill").style.opacity="0.25";document.getElementById("timebar").title="Live stream — cannot seek";}'
+  + 'var lc=document.getElementById("lyrics-container");if(n&&n.lyrics&&n.lyrics.synced&&n.lyrics.synced.length){lc.classList.remove("hidden");if(lc.dataset.title!==n.title){lc.innerHTML="";lc.dataset.title=n.title;n.lyrics.synced.forEach(function(l){var p=document.createElement("p");p.className="lyric-line transition-all duration-300";p.dataset.time=l.t;p.textContent=l.text||"♪";lc.appendChild(p);});}var sp=n.speed||1;var el=(n.positionSec!=null)?(n.positionSec+Math.max(0,(Date.now()-PG.snapAt)/1000)):((n.posBase||0)+Math.max(0,(Date.now()-(n.startedAt||PG.snapAt))/1000)*sp);var lines=Array.from(lc.children);var aIdx=-1;for(var i=0;i<lines.length;i++){if(parseFloat(lines[i].dataset.time)<=el)aIdx=i;else break;}lines.forEach(function(p,i){if(i===aIdx){if(!p.classList.contains("active")){p.classList.add("active");p.style.color="#fcd34d";p.style.transform="scale(1.1)";lc.scrollTop=p.offsetTop-lc.offsetTop-(lc.clientHeight/2)+(p.clientHeight/2);}}else{p.classList.remove("active");p.style.color="";p.style.transform="";}});}else{lc.classList.add("hidden");lc.dataset.title="";}'
+  + 'var dur=n&&n.durationSec?n.durationSec:null;var elb=(n&&n.positionSec!=null)?(n.positionSec+Math.max(0,(Date.now()-PG.snapAt)/1000)):(((n&&n.posBase)||0)+Math.max(0,(Date.now()-((n&&n.startedAt)?n.startedAt:PG.snapAt))/1000)*((n&&n.speed)||1));document.getElementById("tcur").textContent=fmtT(elb);if(dur){document.getElementById("tdur").textContent=fmtT(dur);var pct=Math.max(0,Math.min(100,elb/dur*100));document.getElementById("tfill").style.width=pct+"%";document.getElementById("timebar").title="Click to seek";}else{document.getElementById("tdur").innerHTML="<span id=\'live-dot\' style=\'display:inline-block;width:8px;height:8px;border-radius:50%;background:#fcd34d;margin-right:4px;animation:live-pulse 1.5s ease-in-out infinite\'></span>LIVE";document.getElementById("tfill").style.width="100%";document.getElementById("tfill").style.opacity="0.25";document.getElementById("timebar").title="Live stream — cannot seek";}'
   + 'document.getElementById("pp").textContent=g.player==="paused"?"▶️":"⏸️";document.getElementById("loopb").textContent="Loop · "+g.loop;var v=document.getElementById("vol");if(document.activeElement!==v)v.value=g.volume;var q=document.getElementById("q");q.innerHTML="";(g.queue||[]).forEach(function(x){var li=document.createElement("li");li.className="flex gap-3 py-3";var index=document.createElement("span");index.className="font-mono text-xs text-amber-300";index.textContent=String(q.children.length+1).padStart(2,"0");var title=document.createElement("span");title.className="min-w-0 truncate";title.textContent=x.title||"";li.appendChild(index);li.appendChild(title);q.appendChild(li);});if(!q.children.length){var empty=document.createElement("li");empty.className="py-4 text-sm text-zinc-500";empty.textContent="Queue is empty";q.appendChild(empty);}}'
   + 'function fmtT(s){if(s==null||!isFinite(s)||s<0)return"• LIVE";s=Math.floor(s);var m=Math.floor(s/60);s=s%60;return m+":"+(s<10?"0":"")+s;}'
   + 'document.getElementById("timebar").addEventListener("click",async function(ev){var g=cur();if(!g||!g.nowPlaying||!g.nowPlaying.durationSec){say("Live stream — cannot seek");return;}var r=this.getBoundingClientRect();var ratio=Math.max(0,Math.min(1,(ev.clientX-r.left)/r.width));var sec=Math.floor(ratio*g.nowPlaying.durationSec);try{await api("/api/seek",{guildId:gid(),seconds:sec});say("Seek → "+fmtT(sec));refresh();}catch(e){say(e.message);}});'
@@ -4260,7 +4551,7 @@ function startDashboard() {
   });
   server.on("error", (e) => {
     // Dashboard port blocked (EACCES/EADDRINUSE) must NOT kill the Discord bot.
-    logPretty("ERROR", `Dashboard port ${config.port} failed (${e?.code || e?.message}). Discord still running — set PORT=3100 in .env and restart for dashboard.`);
+    logPretty("ERROR", `Dashboard port ${config.port} failed (${e?.code || e?.message}). Discord still running — set PORT=4000 in .env and restart for dashboard.`);
   });
   server.listen(config.port, () => logPretty("SYSTEM", `Dashboard on port ${config.port} (/health, /login, /dashboard)`));
 }
