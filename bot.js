@@ -5,6 +5,42 @@ const fs = require("fs");
 const os = require("os");
 const crypto = require("crypto");
 
+// --- Single-instance guard ---
+// Two copies of the bot logged in with the same token fight over the voice
+// connection (endless signalling<->connecting, "Cannot perform IP discovery"),
+// answer every interaction twice ("Unknown interaction") and nothing plays.
+// The newest launch wins: an older bot.js still running is terminated.
+(function singleInstanceGuard() {
+  const pidFile = path.join(__dirname, "data", "bot.pid");
+  try {
+    const oldPid = parseInt(fs.readFileSync(pidFile, "utf8"), 10);
+    if (oldPid && oldPid !== process.pid) {
+      let alive = false;
+      try { process.kill(oldPid, 0); alive = true; } catch { }
+      if (alive) {
+        let isNode = true;
+        if (process.platform === "win32") {
+          try {
+            const out = require("child_process").execSync(`tasklist /FI "PID eq ${oldPid}" /FO CSV /NH`, { encoding: "utf8" });
+            isNode = /node\.exe/i.test(out);
+          } catch { isNode = false; }
+        }
+        if (isNode) {
+          console.warn(`[guard] Another bot instance (PID ${oldPid}) is running - stopping it.`);
+          try { process.kill(oldPid, "SIGKILL"); } catch { }
+        }
+      }
+    }
+  } catch { }
+  try {
+    fs.mkdirSync(path.dirname(pidFile), { recursive: true });
+    fs.writeFileSync(pidFile, String(process.pid));
+  } catch { }
+  process.on("exit", () => {
+    try { if (fs.readFileSync(pidFile, "utf8").trim() === String(process.pid)) fs.unlinkSync(pidFile); } catch { }
+  });
+})();
+
 // --- Spotify link support (no direct Spotify audio streaming) ---
 // Accept Spotify TRACK/EPISODE URLs/URIs and convert to a YouTube search query.
 function isSpotifyUrl(s) {
@@ -277,7 +313,13 @@ async function tiktokMetaOnce(pageUrl) {
   // TikWM proxy URL works from any IP (incl. cloud/Railway);
   // TikTok CDN URL (music) is blocked on datacenter IPs.
   const proxyAudioUrl = videoId ? `https://www.tikwm.com/video/music/${videoId}.mp3` : null;
-  return { title: String(title), thumb, audioUrl: String(music), proxyAudioUrl, videoId, duration: d.duration || null, author };
+  // The no-watermark video (faststart MP4) carries the REAL audio heard on
+  // TikTok. The "sound" file above is often only a short snippet of a library
+  // song (e.g. 8s for a 30s clip), so playback would stop early.
+  const rawVideo = d.play || d.wmplay || d.hdplay || null;
+  const videoUrl = rawVideo ? (String(rawVideo).startsWith("http") ? String(rawVideo) : "https://www.tikwm.com" + rawVideo) : null;
+  const musicDuration = Number(d.music_info && d.music_info.duration) || null;
+  return { title: String(title), thumb, audioUrl: String(music), proxyAudioUrl, videoUrl, videoId, duration: d.duration || null, musicDuration, author };
 }
 function tiktokHeaders() {
   return "User-Agent: Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/126.0 Safari/537.36\r\n"
@@ -1643,7 +1685,7 @@ async function runDmMusicCommand(msg, guild, cmd, parts) {
   }
   if (cmd === "np") {
     if (!state.current) return reply({ embeds: [infoEmbed("🎵 Nothing playing", `Use \`/play\` to start`)] });
-    const lyrNp = state.currentLyrics || await fetchLyrics(state.current.title).catch(() => null);
+    const lyrNp = state.currentLyrics || (state.current.isFile || state.current.isLive ? null : await fetchLyrics(state.current.title).catch(() => null));
     return reply({ embeds: [buildNowPlayingEmbed(state, lyrNp)] });
   }
   if (cmd === "queue") {
@@ -1742,6 +1784,8 @@ async function runDmMusicCommand(msg, guild, cmd, parts) {
     return reply({ embeds: [successEmbed("⏭️ Skipped", state.queue.length ? `Next: **${state.queue[0]?.title || "—"}**` : "Queue is empty")] });
   }
   if (cmd === "stop") {
+    if (state.current) deleteIfUploaded(state.current);
+    state.queue.forEach(deleteIfUploaded);
     state.queue = [];
     state.current = null;
     state.startedAt = null;
@@ -1779,6 +1823,7 @@ async function runDmMusicCommand(msg, guild, cmd, parts) {
     if (Number.isNaN(index) || index < 1) return reply({ embeds: [errorEmbed(`Please give the queue number to remove\n**Example:** \`/remove index:3\``)] });
     if (index > state.queue.length) return reply({ embeds: [errorEmbed(`Number is past the queue end (${state.queue.length} tracks)`)] });
     const [rm] = state.queue.splice(index - 1, 1);
+    deleteIfUploaded(rm);
     return reply({ embeds: [successEmbed("🗑️  Removed from queue", `**${rm?.title || "Unknown"}**`)] });
   }
   return reply({ embeds: [errorEmbed(`\`${cmd}\` is not available in private chat`)] });
@@ -1879,8 +1924,6 @@ const commands = [
   new SlashCommandBuilder().setName("stm").setDescription("Stream audio from an uploaded file or local file in Assets")
     .addAttachmentOption(o => o.setName("file").setDescription("Upload an audio file (mp3, wav, flac, ogg, m4a, webm)"))
     .addStringOption(o => o.setName("name").setDescription("Audio file name in Assets folder").setAutocomplete(true)),
-  new SlashCommandBuilder().setName("live").setDescription("Stream live audio (YouTube Live, web radio, HLS/m3u8 stream)")
-    .addStringOption(o => o.setName("url").setDescription("Live stream URL or YouTube Live search").setRequired(true)),
   new SlashCommandBuilder().setName("lyricoffset").setDescription("Shift lyrics timing forwards or backwards (e.g. for music videos with long intros)")
     .addNumberOption(o => o.setName("seconds").setDescription("Seconds to shift (e.g. 15 or -5)").setRequired(true)),
   new SlashCommandBuilder().setName("skip").setDescription("Skip the current song"),
@@ -1925,7 +1968,7 @@ const commands = [
   new SlashCommandBuilder().setName("deletep").setDescription("Delete all messages in the public AI chat")
     .setDefaultMemberPermissions(PermissionFlagsBits.ManageMessages)
     .addBooleanOption(o => o.setName("confirm").setDescription("Confirm deleting every message in the public AI chat").setRequired(true)),
-  new SlashCommandBuilder().setName("clear").setDescription("Clear this server's AI history and private chats")
+  new SlashCommandBuilder().setName("clear").setDescription("Clear this server's AI history, private chats, and music room")
     .setDefaultMemberPermissions(PermissionFlagsBits.ManageChannels),
   new SlashCommandBuilder().setName("panel").setDescription("Open the music control panel (buttons)"),
   new SlashCommandBuilder().setName("setup").setDescription("Create or reuse the music control room")
@@ -2038,6 +2081,51 @@ function setSavedControlChannel(guildId, channelId) {
   all[String(guildId)] = { ...(all[String(guildId)] || {}), controlChannelId: channelId };
   saveGuildSettings(all);
 }
+async function deleteControlRoomMessages(guild) {
+  const channel = await resolveBotTextChannel(guild, null);
+  if (!channel) throw new Error("The control channel could not be resolved.");
+  if (!channel?.messages?.fetch || !channel?.bulkDelete) throw new Error("The configured control channel was not found.");
+  
+  const state = getGuildState(guild);
+  const wasTickerRunning = !!state.ticker;
+  stopNowPlayingTicker(state);
+
+  let deleted = 0;
+  const fourteenDaysMs = 14 * 24 * 60 * 60 * 1000;
+  while (true) {
+    const batch = await channel.messages.fetch({ limit: 100 });
+    if (!batch.size) break;
+    const recent = batch.filter((message) => Date.now() - message.createdTimestamp < fourteenDaysMs);
+    const old = batch.filter((message) => Date.now() - message.createdTimestamp >= fourteenDaysMs);
+    let removedThisBatch = 0;
+
+    if (recent.size > 1) {
+      try {
+        removedThisBatch += (await channel.bulkDelete(recent, true)).size;
+      } catch {
+        for (const message of recent.values()) {
+          try { await message.delete(); removedThisBatch++; } catch { }
+        }
+      }
+    } else if (recent.size === 1) {
+      try { await recent.first().delete(); removedThisBatch++; } catch { }
+    }
+    for (const message of old.values()) {
+      try { await message.delete(); removedThisBatch++; } catch { }
+    }
+
+    if (!removedThisBatch) throw new Error("No messages could be deleted. Check the bot's Manage Messages permission.");
+    deleted += removedThisBatch;
+  }
+  
+  state.npMessage = null;
+  const panel = state.current ? buildNowPlayingEmbed(state, state.currentLyrics) : buildPanelEmbed(guild);
+  await upsertNpMessage(guild, channel.id, panel, true);
+  if (wasTickerRunning && state.current) startNowPlayingTicker(guild, state);
+
+  return deleted;
+}
+
 async function deletePublicAiChat(guild) {
   const channelId = getSavedAiChannel(guild.id);
   if (!channelId) throw new Error("No public AI chat is configured. Run /setai first.");
@@ -2359,7 +2447,7 @@ async function resolveVideoInfo(query) {
     if (!e) return null;
     const url = e.webpage_url || input;
     const title = e.title || query;
-    return { title, url, thumb: pickThumb(e, url), durationSec: numOrNull(e.duration), videoId: extractYouTubeId(e.webpage_url || url) || extractYouTubeId(query) };
+    return { title, url, thumb: pickThumb(e, url), durationSec: numOrNull(e.duration), isLive: !!e.is_live, videoId: extractYouTubeId(e.webpage_url || url) || extractYouTubeId(query) };
   } catch (e) {
     logPretty("ERROR", "video resolve fail: " + (e?.message || e));
     return null;
@@ -2539,6 +2627,7 @@ function spawnUniversalPipe(source, playerClient, offsetSec, isLive = false) {
   );
   if (isLive) {
     ytArgs.push(
+      "--extractor-args", `youtube:player-client=${playerClient || config.ytdlpPlayerClient};player_skip=webpage`,
       "--no-live-from-start",
       "-f", "bestaudio/best",
     );
@@ -2627,6 +2716,45 @@ function spawnFfmpegStdin(tag, offsetSec) {
   return { ff, stream: cushionStream(ff), helper: null, raw: ff.stdout };
 }
 
+// ffmpeg with direct URL input (e.g. for M3U8 live streams).
+function ffmpegUrlArgs(url, offsetSec, isLive = false) {
+  const a = ["-loglevel", "info", "-hide_banner"];
+  if (isLive) {
+    a.push("-reconnect", "1", "-reconnect_streamed", "1", "-reconnect_delay_max", "5");
+  }
+  a.push("-user_agent", "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/126.0.0.0 Safari/537.36");
+  const off = Number(offsetSec);
+  if (Number.isFinite(off) && off > 0) a.push("-ss", String(off));
+  a.push("-i", url, "-vn");
+  a.push("-ac", String(config.audioChannels), "-ar", String(config.audioSampleRate));
+  const afChain = (config.audioFilter || "").trim();
+  if (afChain) a.push("-af", afChain);
+  a.push("-c:a", "libopus", "-b:a", config.opusBitrate);
+  if (config.opusVbr === "off") a.push("-vbr", "off");
+  else if (config.opusVbr === "constrained") a.push("-vbr", "constrained");
+  else a.push("-vbr", "on");
+  if (["audio", "voip", "lowdelay"].includes(config.opusApplication))
+    a.push("-application", config.opusApplication);
+  const fd = Number(config.opusFrameDuration);
+  if ([2.5, 5, 10, 20, 40, 60].includes(fd)) a.push("-frame_duration", String(fd));
+  const cx = Number(config.opusComplexity);
+  if (Number.isFinite(cx) && cx >= 0 && cx <= 10) a.push("-compression_level", String(cx));
+  if (config.ffmpegExtraArgs && config.ffmpegExtraArgs.trim())
+    a.push(...config.ffmpegExtraArgs.trim().split(/\s+/));
+  a.push("-f", "ogg", "pipe:1");
+  return a;
+}
+
+function spawnFfmpegUrlPipe(url, offsetSec, isLive = false) {
+  if (!FFMPEG_AVAILABLE) throw new Error("ffmpeg binary not available");
+  const ff = spawn(FFMPEG || "ffmpeg", ffmpegUrlArgs(url, offsetSec, isLive), { stdio: ["ignore", "pipe", "pipe"] });
+  ff.on("error", (e) => logPretty("ERROR", `ffmpeg(url) error: ` + (e?.message || e)));
+  ff.stdout.on("error", swallowPipeError);
+  ff.stderr.on("error", swallowPipeError);
+  ff.stderr.on("data", (d) => { try { logPretty("LOG", `[ffmpeg(url)] ` + d.toString().trim()); } catch { } });
+  return { ff, stream: cushionStream(ff), helper: null, raw: ff.stdout };
+}
+
 // ffmpeg with local audio file input. Directly reads file with native seek support.
 function ffmpegFileArgs(filePath, offsetSec) {
   const a = ["-loglevel", "info", "-hide_banner"];
@@ -2701,7 +2829,7 @@ async function awaitPrebuffer(pipeObj, minBytes, maxWaitMs) {
   if ((s.readableLength || 0) >= minBytes) return;
   await new Promise((resolve) => {
     let done = false;
-    const cleanup = () => { clearTimeout(timer); s.off("readable", onReadable); s.off("close", onClose); s.off("error", onClose); };
+    const cleanup = () => { clearTimeout(timer); s.off("readable", onReadable); s.off("close", onClose); s.off("error", onClose); s.off("end", onClose); };
     const finish = () => { if (!done) { done = true; cleanup(); resolve(); } };
     const onReadable = () => { if ((s.readableLength || 0) >= minBytes) finish(); };
     const onClose = () => finish(); // dead source → let probe fail fast
@@ -2709,6 +2837,7 @@ async function awaitPrebuffer(pipeObj, minBytes, maxWaitMs) {
     s.on("readable", onReadable);
     s.on("close", onClose);
     s.on("error", onClose);
+    s.on("end", onClose);
   });
 }
 
@@ -2901,6 +3030,16 @@ async function playEndChime(guild, state) {
     });
   } catch (e) { logPretty("WARN", `End jingle failed: ${e?.message || e}`); }
 }
+
+function deleteIfUploaded(item) {
+  if (item && item.isFile && item.filePath) {
+    const uploadsDir = path.join(config.dataDir, "uploads");
+    if (item.filePath.startsWith(uploadsDir)) {
+      try { fs.unlinkSync(item.filePath); } catch {}
+    }
+  }
+}
+
 async function handlePlayerIdle(guild, state) {
   stopNowPlayingTicker(state);
   cleanupCurrentPipeline(state);
@@ -2961,6 +3100,8 @@ async function handlePlayerIdle(guild, state) {
 
   if (state.loopMode === "queue") {
     state.queue.push({ ...finished });
+  } else {
+    deleteIfUploaded(finished);
   }
 
   state.current = null;
@@ -3180,13 +3321,13 @@ async function playSame(guild, textChannelId, item, state = getGuildState(guild)
     // Keep YouTube-synced lyrics across loop/speed/seek restarts; only refetch when missing.
     let lyrRe = (state.currentLyrics?.fromYouTube && Array.isArray(state.currentLyrics.synced) && state.currentLyrics.synced.length)
       ? state.currentLyrics
-      : await fetchLyrics(item.title).catch(() => null);
+      : (item.isFile || item.isLive ? null : await fetchLyrics(item.title).catch(() => null));
     if (stale()) return;
     state.currentLyrics = lyrRe;
     const controlChannelId = getSavedControlChannel(guild.id) || textChannelId;
     await upsertNpMessage(guild, controlChannelId, buildNowPlayingEmbed(state, lyrRe));
     startNowPlayingTicker(guild, state);
-    if (!lyrRe?.fromYouTube) {
+    if (!lyrRe?.fromYouTube && !item.isFile && !item.isLive) {
       fetchYouTubeLyrics(item.videoUrl || item.source).then(async (ytSub) => {
         if (stale() || state.current !== item) return;
         if (ytSub && ytSub.synced?.length) {
@@ -3250,7 +3391,11 @@ async function startPlayback(guild, item, state, stayPut = false) {
 
   // Live stream handling
   if (item.isLive) {
-    await playPipe(guild, item, state, spawnUniversalPipe(source, item.altClient || undefined, 0, true));
+    const pc = item.altClient || config.ytdlpPlayerClient;
+    const info = await ytdlp(source, ytdlpOpts({ dumpSingleJson: true, skipDownload: true, extractorArgs: `youtube:player-client=${pc};player_skip=webpage` }));
+    const e = info?.entries?.[0] || info;
+    if (!e || !e.url) throw new Error("Could not extract live stream URL");
+    await playPipe(guild, item, state, spawnFfmpegUrlPipe(e.url, 0, true));
     return { pageUrl: source };
   }
 
@@ -3262,16 +3407,35 @@ async function startPlayback(guild, item, state, stayPut = false) {
       if (item.title === item.source) item.title = meta.title;
       if (!item.thumb && meta.thumb) item.thumb = meta.thumb;
       
-      // Use the Cloudflare proxy to fetch the TikTok CDN URL
-      const cfProxyUrl = "https://bold-wood-cfdb.locallocal065.workers.dev/?url=" + encodeURIComponent(meta.audioUrl);
-      logPretty("LOG", `[tikwm] audio via CF proxy (fetch) <- ${meta.audioUrl.slice(0, 90)}...`);
-      
-      // Node.js fetch() easily bypasses Cloudflare's Bot Fight Mode which was blocking
-      // ffmpeg and yt-dlp on Railway datacenter IPs. We fetch the stream and pipe it.
-      const res = await fetch(cfProxyUrl, {
-        headers: { 'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/126.0 Safari/537.36' }
-      });
-      if (!res.ok) throw new Error(`CF proxy returned ${res.status}`);
+      const UA = 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/126.0 Safari/537.36';
+      const cfProxy = (u) => "https://bold-wood-cfdb.locallocal065.workers.dev/?url=" + encodeURIComponent(u);
+
+      // Sound clip shorter than the video → it's a snippet; use the video's own audio.
+      const vidDur = Number(meta.duration) || 0;
+      const sndDur = Number(meta.musicDuration) || 0;
+      const soundTruncated = vidDur > 0 && (sndDur === 0 || sndDur + 1 < vidDur);
+      let res = null;
+      if (meta.videoUrl && soundTruncated) {
+        logPretty("LOG", `[tikwm] sound is ${sndDur || "?"}s but video is ${vidDur}s - using video audio`);
+        for (const u of [meta.videoUrl, cfProxy(meta.videoUrl)]) {
+          try {
+            const r = await fetch(u, { headers: { 'User-Agent': UA, 'Referer': 'https://www.tiktok.com/' } });
+            if (r.ok && r.body) { res = r; break; }
+            logPretty("WARN", `[tikwm] video fetch ${r.status} <- ${u.slice(0, 60)}...`);
+          } catch (err) { logPretty("WARN", `[tikwm] video fetch failed: ${err?.message || err}`); }
+        }
+      }
+
+      if (!res) {
+        // Use the Cloudflare proxy to fetch the TikTok CDN URL
+        const cfProxyUrl = cfProxy(meta.audioUrl);
+        logPretty("LOG", `[tikwm] audio via CF proxy (fetch) <- ${meta.audioUrl.slice(0, 90)}...`);
+
+        // Node.js fetch() easily bypasses Cloudflare's Bot Fight Mode which was blocking
+        // ffmpeg and yt-dlp on Railway datacenter IPs. We fetch the stream and pipe it.
+        res = await fetch(cfProxyUrl, { headers: { 'User-Agent': UA } });
+        if (!res.ok) throw new Error(`CF proxy returned ${res.status}`);
+      }
       
       const { Readable } = require("stream");
       const pipeObj = spawnFfmpegStdin("tiktok-cf", consumeOffset(item, state));
@@ -3553,7 +3717,13 @@ client.on("interactionCreate", async (itx) => {
     }
     await itx.deferReply({ flags: MessageFlags.Ephemeral });
     const result = await clearGuildAiChats(itx.guildId);
-    return itx.editReply({ content: `Cleared ${result.clearedHistories} saved AI conversation(s) and closed ${result.closedPrivateChats} temporary private chat(s). Public channel messages were not deleted.` });
+    let musicDeleted = 0;
+    try {
+      musicDeleted = await deleteControlRoomMessages(itx.guild);
+    } catch (e) {
+      logPretty("WARN", "Failed to clear music room: " + (e?.message || e));
+    }
+    return itx.editReply({ content: `Cleared ${result.clearedHistories} saved AI conversation(s) and closed ${result.closedPrivateChats} temporary private chat(s). Deleted ${musicDeleted} messages from music room.` });
   }
 
   if (itx.commandName === "delete") {
@@ -3925,44 +4095,6 @@ client.on("interactionCreate", async (itx) => {
     return itx.editReply({ embeds: [addedSlash] });
   }
 
-  if (itx.commandName === "live") {
-    await itx.deferReply({ flags: MessageFlags.Ephemeral });
-    const rawUrl = itx.options.getString("url", true).trim();
-    const cleanUrl = sanitizeSearchQuery(rawUrl);
-
-    const item = {
-      title: cleanUrl,
-      source: cleanUrl,
-      isLive: true,
-      durationSec: null,
-      requestedBy: itx.user.tag,
-      guild: itx.guild,
-      voiceChannelId: userVC,
-      textChannelId: itx.channelId,
-    };
-
-    state.queue.push(item);
-    const shouldStart = !state.current;
-    const metaP = resolveTitleAndThumb(cleanUrl);
-    if (shouldStart) playNext(itx.guild, itx.channelId, state);
-    const meta = await metaP;
-    if (meta.title && meta.title !== cleanUrl) item.title = meta.title;
-    if (meta.thumb) item.thumb = meta.thumb;
-    item.durationSec = null;
-    if (meta.videoUrl) item.videoUrl = meta.videoUrl;
-
-    const addedLive = makeEmbed(COLORS.music)
-      .setDescription(`### 🔴 Live Stream Added`)
-      .addFields(
-        { name: "📡 Broadcast", value: `**${cleanTitle(item.title)}**`, inline: false },
-        { name: "🔴 Status", value: "`• LIVE`", inline: true },
-        { name: "📋 Queue position", value: `\`#${state.queue.length}\``, inline: true },
-        { name: "👤 Requested by", value: `${itx.user}`, inline: true },
-      );
-    if (item.thumb) addedLive.setThumbnail(item.thumb);
-    return itx.editReply({ embeds: [addedLive] });
-  }
-
   if (itx.commandName === "skip") {
     state.skipRequested = true;
     state.player.stop(true);
@@ -3972,6 +4104,8 @@ client.on("interactionCreate", async (itx) => {
   }
 
   if (itx.commandName === "stop") {
+    if (state.current) deleteIfUploaded(state.current);
+    state.queue.forEach(deleteIfUploaded);
     state.queue = [];
     state.current = null;
     state.startedAt = null;
@@ -4001,7 +4135,7 @@ client.on("interactionCreate", async (itx) => {
 
   if (itx.commandName === "np" || itx.commandName === "p") {
     if (!state.current) return itx.reply({ embeds: [infoEmbed("🎵 Nothing playing", "Use `/play query:<song>` to start")] });
-    const lyrNpS = state.currentLyrics || await fetchLyrics(state.current.title).catch(() => null);
+    const lyrNpS = state.currentLyrics || (state.current.isFile || state.current.isLive ? null : await fetchLyrics(state.current.title).catch(() => null));
     return itx.reply({ embeds: [buildNowPlayingEmbed(state, lyrNpS)], components: buildControlRows(state) });
   }
 
@@ -4102,6 +4236,7 @@ client.on("interactionCreate", async (itx) => {
       return itx.reply({ embeds: [errorEmbed(`Invalid number (${state.queue.length} in the queue)`)], flags: MessageFlags.Ephemeral });
     }
     const [removed] = state.queue.splice(index - 1, 1);
+    deleteIfUploaded(removed);
     return itx.reply({ embeds: [successEmbed("🗑️  Removed from queue", `**${removed.title}**`)] });
   }
 
