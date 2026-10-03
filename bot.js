@@ -1189,7 +1189,7 @@ async function fetchYouTubeLyrics(videoUrl) {
         const args = [
           "--write-auto-sub", "--write-sub", "--sub-langs", "en.*,ja.*,original",
           "--skip-download", "--no-warnings",
-          "-o", tmpFile, videoUrl
+          "-o", tmpFile, "--", videoUrl
         ];
         const proc = spawn(YTDLP_BIN, args, { stdio: ["ignore", "pipe", "pipe"] });
         let stderr = "";
@@ -1780,6 +1780,12 @@ async function handleDmMessage(msg) {
     if (DM_MUSIC_COMMANDS.has(cmd)) {
       const guild = await dmTargetGuild(msg.author.id);
       if (!guild) return msg.reply({ embeds: [errorEmbed("I don't share any server with you yet — invite me and run `/setup` there first.")] });
+      const member = guild.members.cache.get(msg.author.id) || await guild.members.fetch(msg.author.id).catch(() => null);
+      const userVc = member?.voice?.channelId;
+      const botVc = guild.members.me?.voice?.channelId;
+      if (!userVc || (botVc && userVc !== botVc)) {
+        return msg.reply({ embeds: [errorEmbed(`You must be in the bot's voice room in **${guild.name}** to control playback.`)] });
+      }
       return runDmMusicCommand(msg, guild, cmd, parts);
     }
     if (looksLikeCommand) {
@@ -1851,12 +1857,13 @@ const commands = [
   new SlashCommandBuilder().setName("pause").setDescription("Pause"),
   new SlashCommandBuilder().setName("resume").setDescription("Resume"),
   new SlashCommandBuilder().setName("ping").setDescription("Check ping"),
-  new SlashCommandBuilder().setName("botupdate").setDescription("Update yt-dlp"),
+  new SlashCommandBuilder().setName("botupdate").setDescription("Update yt-dlp (admin)")
+    .setDefaultMemberPermissions(PermissionFlagsBits.ManageGuild),
   new SlashCommandBuilder().setName("p").setDescription("What's playing right now"),
   new SlashCommandBuilder().setName("queue").setDescription("Show the remaining queue"),
   new SlashCommandBuilder().setName("list").setDescription("Show the remaining queue"),
-  new SlashCommandBuilder().setName("volume").setDescription("Adjust volume (0-10000)")
-    .addIntegerOption(o => o.setName("value").setDescription("Percent (0-10000)").setRequired(true).setMinValue(0).setMaxValue(10000)),
+  new SlashCommandBuilder().setName("volume").setDescription("Adjust volume (0-200)")
+    .addIntegerOption(o => o.setName("value").setDescription("Percent (0-200)").setRequired(true).setMinValue(0).setMaxValue(200)),
   new SlashCommandBuilder().setName("playlist").setDescription("Add songs in bulk from YouTube (playlist or search)")
     .addStringOption(o => o.setName("query").setDescription("Playlist link or search text").setRequired(true))
     .addIntegerOption(o => o.setName("limit").setDescription("Max count (omit = whole playlist) (1-5000)").setMinValue(1).setMaxValue(5000)),
@@ -1894,12 +1901,15 @@ const commands = [
     .setDefaultMemberPermissions(PermissionFlagsBits.ManageGuild),
   new SlashCommandBuilder().setName("ytstatus").setDescription("Check YouTube sign-in status"),
   new SlashCommandBuilder().setName("ytsignin").setDescription("Sign in YouTube with cookies.txt (admin)")
+    .setDefaultMemberPermissions(PermissionFlagsBits.ManageGuild)
     .addAttachmentOption(o => o.setName("file").setDescription("cookies.txt file").setRequired(true)),
-  new SlashCommandBuilder().setName("ytsignout").setDescription("Remove YouTube cookies (admin)"),
+  new SlashCommandBuilder().setName("ytsignout").setDescription("Remove YouTube cookies (admin)")
+    .setDefaultMemberPermissions(PermissionFlagsBits.ManageGuild),
   new SlashCommandBuilder().setName("video").setDescription("Share the video page + play audio in voice (YouTube)")
     .addStringOption(o => o.setName("query").setDescription("Video name/YouTube URL").setRequired(true)),
   new SlashCommandBuilder().setName("watchtogether").setDescription("Watch video together in voice chat (Watch Together)"),
-  new SlashCommandBuilder().setName("vstate").setDescription("Debug: voice/player status (admin)"),
+  new SlashCommandBuilder().setName("vstate").setDescription("Debug: voice/player status (admin)")
+    .setDefaultMemberPermissions(PermissionFlagsBits.ManageGuild),
   new SlashCommandBuilder().setName("batchplay").setDescription("Add multiple songs at once (opens a form to paste links)"),
 ].map(c => c.toJSON());
 
@@ -2188,7 +2198,27 @@ function cleanupCurrentPipeline(state) {
     state.currentPipe = null;
   }
 }
-function isUrl(s) { try { new URL(s); return true; } catch { return false; } }
+function isUrl(s) {
+  if (typeof s !== "string" || !s.trim()) return false;
+  try {
+    const u = new URL(s);
+    if (u.protocol !== "http:" && u.protocol !== "https:") return false;
+    const h = u.hostname.toLowerCase();
+    // Block loopback, link-local, cloud metadata service (169.254.169.254), and private IPs
+    if (h === "localhost" || h === "127.0.0.1" || h === "::1" || h === "0.0.0.0" || h === "169.254.169.254") return false;
+    if (/^(10\.|172\.(1[6-9]|2[0-9]|3[0-1])\.|192\.168\.)/.test(h)) return false;
+    return true;
+  } catch {
+    return false;
+  }
+}
+function sanitizeSearchQuery(q) {
+  let s = String(q || "").trim();
+  while (s.startsWith("-")) {
+    s = s.replace(/^-+/, "").trim();
+  }
+  return s.replace(/[\r\n]/g, " ");
+}
 
 // yt-dlp helper functions
 async function getTitle(input) {
@@ -2228,7 +2258,8 @@ async function resolveTitleAndThumb(input) {
       const meta = await spotifyMeta(input);
       if (meta.title && meta.title !== input) return { ...meta, durationSec: null };
     }
-    const info = await ytdlp(input, ytdlpOpts({ dumpSingleJson: true, skipDownload: true, noWarnings: true }));
+    const target = isUrl(input) ? input : `ytsearch1:${sanitizeSearchQuery(input)}`;
+    const info = await ytdlp(target, ytdlpOpts({ dumpSingleJson: true, skipDownload: true, noWarnings: true }));
     const e = info?.entries?.[0] || info;
     if (e?.title) {
       const url = e.webpage_url || input;
@@ -2260,7 +2291,8 @@ async function resolveFirstVideoUrl(query) {
   }
   if (isUrl(query)) return query;
   try {
-    const out = await ytdlp(`ytsearch1:${query}`, ytdlpOpts({ dumpSingleJson: true }));
+    const cleanQuery = sanitizeSearchQuery(query);
+    const out = await ytdlp(`ytsearch1:${cleanQuery}`, ytdlpOpts({ dumpSingleJson: true }));
     return out?.entries?.[0]?.webpage_url || null;
   } catch (e) {
     logPretty("ERROR", "search resolve fail: " + (e?.message || e));
@@ -2288,7 +2320,7 @@ async function resolveVideoInfo(query) {
     if (!q2) return null;
     input = q2;
   }
-  if (!isUrl(input)) input = `ytsearch1:${input}`;
+  if (!isUrl(input)) input = `ytsearch1:${sanitizeSearchQuery(input)}`;
   try {
     const info = await ytdlp(input, ytdlpOpts({ dumpSingleJson: true, skipDownload: true, noWarnings: true }));
     const e = info?.entries?.[0] || info;
@@ -2490,7 +2522,7 @@ function spawnUniversalPipe(source, playerClient, offsetSec) {
       "--concurrent-fragments", "4",
     );
   }
-  ytArgs.push("-o", "-", source);
+  ytArgs.push("-o", "-", "--", source);
   const helper = spawn(YTDLP_BIN, ytArgs, { stdio: ["ignore", "pipe", "pipe"] });
   helper.on("error", (e) => logPretty("ERROR", "yt-dlp(universal) error: " + (e?.message || e)));
   helper.stdout.on("error", swallowPipeError);
@@ -2738,7 +2770,7 @@ async function fetchPlaylistEntries(input, limit = null) {
       }
     } else {
       const n = Number.isFinite(max) ? max : 25;
-      const out = await ytdlp(`ytsearch${n}:${input}`, ytdlpOpts({ dumpSingleJson: true }));
+      const out = await ytdlp(`ytsearch${n}:${sanitizeSearchQuery(input)}`, ytdlpOpts({ dumpSingleJson: true }));
       const arr = out?.entries || [];
       for (const e of arr) {
         if (entries.length >= n) break;
@@ -3095,10 +3127,10 @@ async function startPlayback(guild, item, state, stayPut = false) {
     if (kind === "album" || kind === "playlist") throw new Error("Spotify albums/playlists not supported in play; use /playlist");
     const q = await spotifyTrackToSearchQuery(source);
     if (!q) throw new Error("cannot resolve Spotify track title");
-    source = `ytsearch1:${q}`;
+    source = `ytsearch1:${sanitizeSearchQuery(q)}`;
   } else if (!isUrl(source)) {
     // Plain text search query — prefix with ytsearch so yt-dlp searches YouTube
-    source = `ytsearch1:${source}`;
+    source = `ytsearch1:${sanitizeSearchQuery(source)}`;
   }
 
   // TikTok: metadata via TikWM. Audio is streamed via Cloudflare Worker proxy
@@ -3186,7 +3218,7 @@ async function playPipe(guild, item, state, pipeObj) {
 
 function setVolumePct(state, pct) {
   if (pct < 0) pct = 0;
-  if (pct > 10000) pct = 10000;
+  if (pct > 200) pct = 200;
   state.volumePct = pct;
   applyVolume(state);
   // Remember per server across restarts
@@ -3259,7 +3291,7 @@ client.on("interactionCreate", async (itx) => {
     try {
       await itx.deferReply({ flags: MessageFlags.Ephemeral });
       const raw = itx.fields.getTextInputValue("batch_play_links");
-      const lines = raw.split(/\r?\n/).map(l => l.trim()).filter(l => l.length > 0);
+      const lines = raw.split(/\r?\n/).map(l => l.trim()).filter(l => l.length > 0).slice(0, 25);
       if (!lines.length) return itx.editReply({ embeds: [errorEmbed("No links or song names provided")] });
       const guild = itx.guild;
       const state = getGuildState(guild);
@@ -3351,6 +3383,9 @@ client.on("interactionCreate", async (itx) => {
     await itx.deferReply({ flags: MessageFlags.Ephemeral });
     try {
       const privateSession = await getPrivateAiSession(itx);
+      if (!privateSession && !isGuildAdmin(itx.member)) {
+        return itx.editReply({ content: "Manage Server permission required to change public AI persona." });
+      }
       const reset = itx.options.getBoolean("reset") === true;
       let persona = "";
       if (!reset) {
@@ -3373,6 +3408,9 @@ client.on("interactionCreate", async (itx) => {
   }
 
   if (itx.commandName === "clear") {
+    if (!itx.member?.permissions?.has?.(PermissionFlagsBits.ManageChannels) && !isGuildAdmin(itx.member)) {
+      return itx.reply({ embeds: [errorEmbed("Manage Channels permission required")], flags: MessageFlags.Ephemeral });
+    }
     await itx.deferReply({ flags: MessageFlags.Ephemeral });
     const result = await clearGuildAiChats(itx.guildId);
     return itx.editReply({ content: `Cleared ${result.clearedHistories} saved AI conversation(s) and closed ${result.closedPrivateChats} temporary private chat(s). Public channel messages were not deleted.` });
@@ -3407,6 +3445,9 @@ client.on("interactionCreate", async (itx) => {
   }
 
   if (itx.commandName === "deletep") {
+    if (!itx.member?.permissions?.has?.(PermissionFlagsBits.ManageMessages) && !isGuildAdmin(itx.member)) {
+      return itx.reply({ embeds: [errorEmbed("Manage Messages permission required")], flags: MessageFlags.Ephemeral });
+    }
     if (!itx.options.getBoolean("confirm", true)) {
       return itx.reply({ content: "Deletion cancelled. Run `/deletep` with `confirm: true` to remove all public AI chat messages.", flags: MessageFlags.Ephemeral });
     }
@@ -3420,6 +3461,9 @@ client.on("interactionCreate", async (itx) => {
   }
 
   if (itx.commandName === "setai") {
+    if (!itx.member?.permissions?.has?.(PermissionFlagsBits.ManageChannels) && !isGuildAdmin(itx.member)) {
+      return itx.reply({ embeds: [errorEmbed("Manage Channels permission required")], flags: MessageFlags.Ephemeral });
+    }
     await itx.deferReply({ flags: MessageFlags.Ephemeral });
     try {
       const savedChannelId = getSavedAiChannel(itx.guildId);
@@ -3511,6 +3555,7 @@ client.on("interactionCreate", async (itx) => {
   }
 
   if (itx.commandName === "botupdate") {
+    if (!isGuildAdmin(itx.member)) return itx.reply({ embeds: [errorEmbed("Manage Server permission required")], flags: MessageFlags.Ephemeral });
     await itx.deferReply({ flags: MessageFlags.Ephemeral });
     await runYtDlpUpdate((msg) => itx.editReply({
       embeds: [
@@ -3547,6 +3592,7 @@ client.on("interactionCreate", async (itx) => {
     try {
       const att = itx.options.getAttachment("file");
       if (!att) return itx.editReply({ embeds: [errorEmbed("Attach the cookies.txt file")] });
+      if (att.size > 2 * 1024 * 1024) return itx.editReply({ embeds: [errorEmbed("File too large (max 2MB)")] });
       const r = await fetch(att.url);
       const text = await r.text();
       const saved = saveYTCookies(text);
@@ -3822,8 +3868,28 @@ const dashLoginAttempts = new Map(); // ip -> { count, reset }
 const DASH_SESSION_TTL_MS = 12 * 3600 * 1000;
 
 function dashClientIp(req) {
+  const fwd = req.headers["x-forwarded-for"] || req.headers["cf-connecting-ip"];
+  if (typeof fwd === "string" && fwd.trim()) {
+    return fwd.split(",")[0].trim();
+  }
   return (req.socket?.remoteAddress || "unknown").toString();
 }
+function dashConstantTimeCompare(a, b) {
+  const ha = crypto.createHash("sha256").update(String(a || "")).digest();
+  const hb = crypto.createHash("sha256").update(String(b || "")).digest();
+  return crypto.timingSafeEqual(ha, hb);
+}
+// Clean up expired sessions and reset old rate limit counters every 10 min
+setInterval(() => {
+  const now = Date.now();
+  for (const [t, s] of dashSessions) {
+    if (now > s.exp) dashSessions.delete(t);
+  }
+  for (const [ip, e] of dashLoginAttempts) {
+    if (now > e.reset) dashLoginAttempts.delete(ip);
+  }
+}, 10 * 60 * 1000).unref?.();
+
 function dashRateLimited(ip) {
   const now = Date.now();
   const e = dashLoginAttempts.get(ip);
@@ -4408,23 +4474,48 @@ function startDashboard() {
     try {
       const url = new URL(req.url || "/", "http://localhost");
       const p = url.pathname;
-      if (p === "/health") { res.writeHead(200, { "Content-Type": "text/plain" }); res.end("Discord music bot is running"); return; }
+      if (req.method === "POST" && p !== "/login") {
+        const origin = req.headers.origin;
+        if (origin) {
+          try {
+            const u = new URL(origin);
+            if (u.host !== req.headers.host) {
+              res.writeHead(403, { "Content-Type": "application/json", "X-Content-Type-Options": "nosniff" });
+              res.end(JSON.stringify({ error: "cross-origin request forbidden" }));
+              return;
+            }
+          } catch {
+            res.writeHead(403, { "Content-Type": "application/json", "X-Content-Type-Options": "nosniff" });
+            res.end(JSON.stringify({ error: "invalid origin header" }));
+            return;
+          }
+        }
+      }
+      if (p === "/health") { res.writeHead(200, { "Content-Type": "text/plain", "X-Content-Type-Options": "nosniff" }); res.end("Discord music bot is running"); return; }
       if (p === "/") { res.writeHead(302, { Location: "/dashboard" }); res.end(); return; }
-      if (p === "/login" && req.method === "GET") { res.writeHead(200, { "Content-Type": "text/html; charset=utf-8" }); res.end(dashLoginPage()); return; }
+      if (p === "/login" && req.method === "GET") { res.writeHead(200, { "Content-Type": "text/html; charset=utf-8", "X-Content-Type-Options": "nosniff", "X-Frame-Options": "SAMEORIGIN" }); res.end(dashLoginPage()); return; }
       if (p === "/login" && req.method === "POST") {
         const ip = dashClientIp(req);
-        if (dashRateLimited(ip)) { res.writeHead(429, { "Content-Type": "text/html" }); res.end(dashLoginPage("Too many attempts, try again in 5 min")); return; }
+        if (dashRateLimited(ip)) { res.writeHead(429, { "Content-Type": "text/html", "X-Content-Type-Options": "nosniff" }); res.end(dashLoginPage("Too many attempts, try again in 5 min")); return; }
         const body = await dashBody(req, 64 * 1024);
         const f = dashParseForm(body);
-        if (!config.dashboardPassword) { dashNoteFail(ip); res.writeHead(200, { "Content-Type": "text/html" }); res.end(dashLoginPage("DASHBOARD_PASSWORD not set in .env — set it and restart")); return; }
-        if ((f.username || "") === config.dashboardUser && (f.password || "") === config.dashboardPassword) {
+        if (!config.dashboardPassword) { dashNoteFail(ip); res.writeHead(200, { "Content-Type": "text/html", "X-Content-Type-Options": "nosniff" }); res.end(dashLoginPage("DASHBOARD_PASSWORD not set in .env — set it and restart")); return; }
+        const userMatch = dashConstantTimeCompare(f.username || "", config.dashboardUser);
+        const passMatch = dashConstantTimeCompare(f.password || "", config.dashboardPassword);
+        if (userMatch && passMatch) {
           const t = dashCreateSession(config.dashboardUser);
-          res.writeHead(302, { Location: "/dashboard", "Set-Cookie": `dash_session=${t}; HttpOnly; Path=/; SameSite=Lax; Max-Age=${12 * 3600}` });
+          const isHttps = req.headers["x-forwarded-proto"] === "https" || req.socket?.encrypted;
+          res.writeHead(302, {
+            Location: "/dashboard",
+            "Set-Cookie": `dash_session=${t}; HttpOnly; Path=/; SameSite=Lax; Max-Age=${12 * 3600}${isHttps ? "; Secure" : ""}`,
+            "X-Content-Type-Options": "nosniff",
+            "X-Frame-Options": "SAMEORIGIN",
+          });
           res.end(); return;
         }
         dashNoteFail(ip);
         logPretty("WARN", "Dashboard login failed", { tail: ip });
-        res.writeHead(200, { "Content-Type": "text/html" }); res.end(dashLoginPage("Invalid username or password")); return;
+        res.writeHead(200, { "Content-Type": "text/html", "X-Content-Type-Options": "nosniff" }); res.end(dashLoginPage("Invalid username or password")); return;
       }
       if (p === "/logout") {
         const t = dashParseCookies(req).dash_session;
@@ -4553,6 +4644,9 @@ function startDashboard() {
     // Dashboard port blocked (EACCES/EADDRINUSE) must NOT kill the Discord bot.
     logPretty("ERROR", `Dashboard port ${config.port} failed (${e?.code || e?.message}). Discord still running — set PORT=4000 in .env and restart for dashboard.`);
   });
+  server.setTimeout(30000);
+  server.headersTimeout = 35000;
+  server.requestTimeout = 30000;
   server.listen(config.port, () => logPretty("SYSTEM", `Dashboard on port ${config.port} (/health, /login, /dashboard)`));
 }
 startDashboard();
