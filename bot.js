@@ -1005,6 +1005,8 @@ function buildHelpEmbedSlash() {
         name: "🎶 Play & queue",
         value: [
           "`/play query:<name/URL>` — Play or queue a song",
+          "`/stm [file:<upload>] [name:<Assets file>]` — Stream audio from file",
+          "`/live url:<stream URL/search>` — Stream live audio (YouTube Live, radio)",
           "`/batchplay` — Open a form to add multiple songs at once",
           "`/playlist query:<URL/search> limit:<N>` — Load songs in bulk",
           "`/queue` — Show the full queue",
@@ -1612,7 +1614,7 @@ async function handleAiChatMessage(msg) {
 // commands run against the shared server; dangerous/admin commands are
 // filtered out; plain text gets a conversational reply.
 const DM_BLOCKED_COMMANDS = new Set(["ytsignin", "ytsignout", "botupdate", "setup", "setai", "setaip", "delete", "deletep", "clear", "airef", "vstate", "watchtogether", "video"]);
-const DM_MUSIC_COMMANDS = new Set(["play", "playlist", "skip", "stop", "pause", "resume", "queue", "np", "remove", "shuffle", "loop", "volume", "panel"]);
+const DM_MUSIC_COMMANDS = new Set(["play", "playlist", "skip", "stop", "pause", "resume", "queue", "np", "remove", "shuffle", "loop", "volume", "panel", "live"]);
 const DM_COMMAND_ALIASES = { p: "play", q: "queue", now: "np", next: "skip", s: "skip", st: "stop", vol: "volume", upd: "botupdate", h: "help", controls: "panel" };
 async function dmTargetGuild(userId) {
   let mutual = null;
@@ -1707,6 +1709,30 @@ async function runDmMusicCommand(msg, guild, cmd, parts) {
     });
     if (!state.current) playNext(guild, textChannelId, state);
     return;
+  }
+  if (cmd === "live") {
+    const raw = parts.join(" ").trim();
+    if (!raw) return reply({ embeds: [errorEmbed("Give me a live stream URL or search query\n**Example:** `live https://www.youtube.com/watch?v=...`")] });
+    const cleanUrl = sanitizeSearchQuery(raw);
+    const item = {
+      title: cleanUrl,
+      source: cleanUrl,
+      isLive: true,
+      durationSec: null,
+      requestedBy: msg.author.tag,
+      guild,
+      voiceChannelId: userVC,
+      textChannelId,
+    };
+    state.queue.push(item);
+    const shouldStart = !state.current;
+    if (shouldStart) playNext(guild, textChannelId, state);
+    resolveTitleAndThumb(cleanUrl).then(meta => {
+      if (meta.title && meta.title !== cleanUrl) item.title = meta.title;
+      if (meta.thumb) item.thumb = meta.thumb;
+      item.durationSec = null;
+    }).catch(() => {});
+    return reply({ embeds: [successEmbed("🔴 Live Stream Queued", `**${cleanUrl}**`)] });
   }
   if (cmd === "skip") {
     if (!state.current) return reply({ embeds: [infoEmbed(" Nothing playing", "Nothing to skip")] });
@@ -1850,6 +1876,11 @@ client.on("messageCreate", async (msg) => {
 const commands = [
   new SlashCommandBuilder().setName("play").setDescription("Play music from YouTube (song name or URL)")
     .addStringOption(o => o.setName("query").setDescription("Song name/URL").setRequired(true)),
+  new SlashCommandBuilder().setName("stm").setDescription("Stream audio from an uploaded file or local file in Assets")
+    .addAttachmentOption(o => o.setName("file").setDescription("Upload an audio file (mp3, wav, flac, ogg, m4a, webm)"))
+    .addStringOption(o => o.setName("name").setDescription("Audio file name in Assets folder").setAutocomplete(true)),
+  new SlashCommandBuilder().setName("live").setDescription("Stream live audio (YouTube Live, web radio, HLS/m3u8 stream)")
+    .addStringOption(o => o.setName("url").setDescription("Live stream URL or YouTube Live search").setRequired(true)),
   new SlashCommandBuilder().setName("lyricoffset").setDescription("Shift lyrics timing forwards or backwards (e.g. for music videos with long intros)")
     .addNumberOption(o => o.setName("seconds").setDescription("Seconds to shift (e.g. 15 or -5)").setRequired(true)),
   new SlashCommandBuilder().setName("skip").setDescription("Skip the current song"),
@@ -2263,7 +2294,8 @@ async function resolveTitleAndThumb(input) {
     const e = info?.entries?.[0] || info;
     if (e?.title) {
       const url = e.webpage_url || input;
-      return { title: e.title, thumb: pickThumb(e, url) || thumbFor(input), durationSec: numOrNull(e.duration), videoUrl: e.webpage_url || null };
+      const isLive = !!(e.is_live || e.live_status === "is_live");
+      return { title: e.title, thumb: pickThumb(e, url) || thumbFor(input), durationSec: isLive ? null : numOrNull(e.duration), videoUrl: e.webpage_url || null, isLive };
     }
   } catch { }
   return { title: input, thumb: thumbFor(input), durationSec: null };
@@ -2489,7 +2521,7 @@ function spawnFfmpegFromDirectUrl(url, headersStr) {
 function altPlayerClient(primary) {
   return /android/i.test(primary || "") ? "web,web_creator" : "android";
 }
-function spawnUniversalPipe(source, playerClient, offsetSec) {
+function spawnUniversalPipe(source, playerClient, offsetSec, isLive = false) {
   if (!FFMPEG_AVAILABLE) throw new Error("ffmpeg binary not available");
 
   // ── yt-dlp ───────────────────────────────────────────────────────────────
@@ -2501,11 +2533,16 @@ function spawnUniversalPipe(source, playerClient, offsetSec) {
   ytArgs.push(
     "--no-check-certificates",
     "--retries", "infinite",
-    "--fragment-retries", "infinite",
+    "--fragment-retries", isLive ? "10" : "infinite",
     "--buffer-size", "64K",
     "--js-runtimes", "node",
   );
-  if (isTikTok) {
+  if (isLive) {
+    ytArgs.push(
+      "--no-live-from-start",
+      "-f", "bestaudio/best",
+    );
+  } else if (isTikTok) {
     // TikTok: needs impersonation to avoid 403
     // and must pick audio-only formats (some clips are video-only)
     ytArgs.push(
@@ -2530,7 +2567,7 @@ function spawnUniversalPipe(source, playerClient, offsetSec) {
   helper.stderr.on("data", (d) => { try { logPretty("LOG", "[yt-dlp] " + d.toString().trim()); } catch { } });
 
   // ── ffmpeg ────────────────────────────────────────────────────────────────
-  const a = ffmpegStdinArgs(offsetSec);
+  const a = ffmpegStdinArgs(isLive ? 0 : offsetSec);
 
   const ff = spawn(FFMPEG || "ffmpeg", a, { stdio: ["pipe", "pipe", "pipe"] });
   ff.on("error", (e) => logPretty("ERROR", "ffmpeg(universal) error: " + (e?.message || e)));
@@ -2588,6 +2625,63 @@ function spawnFfmpegStdin(tag, offsetSec) {
   ff.stdin.on("error", swallowPipeError);
   ff.stderr.on("data", (d) => { try { logPretty("LOG", `[ffmpeg(${tag})] ` + d.toString().trim()); } catch { } });
   return { ff, stream: cushionStream(ff), helper: null, raw: ff.stdout };
+}
+
+// ffmpeg with local audio file input. Directly reads file with native seek support.
+function ffmpegFileArgs(filePath, offsetSec) {
+  const a = ["-loglevel", "info", "-hide_banner"];
+  const off = Number(offsetSec);
+  if (Number.isFinite(off) && off > 0) a.push("-ss", String(off));
+  a.push("-i", filePath, "-vn");
+  a.push("-ac", String(config.audioChannels), "-ar", String(config.audioSampleRate));
+  const afChain = (config.audioFilter || "").trim();
+  if (afChain) a.push("-af", afChain);
+  a.push("-c:a", "libopus", "-b:a", config.opusBitrate);
+  if (config.opusVbr === "off") a.push("-vbr", "off");
+  else if (config.opusVbr === "constrained") a.push("-vbr", "constrained");
+  else a.push("-vbr", "on");
+  if (["audio", "voip", "lowdelay"].includes(config.opusApplication))
+    a.push("-application", config.opusApplication);
+  const fd = Number(config.opusFrameDuration);
+  if ([2.5, 5, 10, 20, 40, 60].includes(fd)) a.push("-frame_duration", String(fd));
+  const cx = Number(config.opusComplexity);
+  if (Number.isFinite(cx) && cx >= 0 && cx <= 10) a.push("-compression_level", String(cx));
+  if (config.ffmpegExtraArgs && config.ffmpegExtraArgs.trim())
+    a.push(...config.ffmpegExtraArgs.trim().split(/\s+/));
+  a.push("-f", "ogg", "pipe:1");
+  return a;
+}
+
+function spawnFfmpegFilePipe(filePath, offsetSec) {
+  if (!FFMPEG_AVAILABLE) throw new Error("ffmpeg binary not available");
+  const ff = spawn(FFMPEG || "ffmpeg", ffmpegFileArgs(filePath, offsetSec), { stdio: ["ignore", "pipe", "pipe"] });
+  ff.on("error", (e) => logPretty("ERROR", `ffmpeg(file) error: ` + (e?.message || e)));
+  ff.stdout.on("error", swallowPipeError);
+  ff.stderr.on("error", swallowPipeError);
+  ff.stderr.on("data", (d) => { try { logPretty("LOG", "[ffmpeg(file)] " + d.toString().trim()); } catch { } });
+  return { ff, stream: cushionStream(ff), helper: null, raw: ff.stdout };
+}
+
+// Quick metadata resolution for audio files via ffmpeg -i
+async function resolveAudioFileMeta(filePath) {
+  return new Promise((resolve) => {
+    try {
+      const ff = spawn(FFMPEG || "ffmpeg", ["-hide_banner", "-i", filePath]);
+      let errBuf = "";
+      ff.stderr.on("data", (d) => { errBuf += d.toString(); });
+      ff.on("close", () => {
+        let durationSec = null;
+        const match = errBuf.match(/Duration:\s*(\d+):(\d+):(\d+(?:\.\d+)?)/);
+        if (match) {
+          durationSec = Number(match[1]) * 3600 + Number(match[2]) * 60 + parseFloat(match[3]);
+        }
+        resolve({ durationSec: Number.isFinite(durationSec) && durationSec > 0 ? durationSec : null });
+      });
+      ff.on("error", () => resolve({ durationSec: null }));
+    } catch {
+      resolve({ durationSec: null });
+    }
+  });
 }
 // Wrap an ffmpeg process's stdout in a PassThrough cushion (up to 384KB ≈
 // 24s of 128k audio) so slow-starting sources don't stutter the beginning.
@@ -2825,7 +2919,16 @@ async function handlePlayerIdle(guild, state) {
   if (!state.prevJump && finished && finished.source) {
     const h = state.history || (state.history = []);
     if (!h.length || h[h.length - 1].title !== finished.title) {
-      h.push({ title: finished.title, source: finished.source, thumb: finished.thumb || null, durationSec: finished.durationSec || null, requestedBy: finished.requestedBy });
+      h.push({
+        title: finished.title,
+        source: finished.source,
+        thumb: finished.thumb || null,
+        durationSec: finished.durationSec || null,
+        requestedBy: finished.requestedBy,
+        filePath: finished.filePath || null,
+        isFile: !!finished.isFile,
+        isLive: !!finished.isLive,
+      });
       if (h.length > 30) h.shift();
     }
   }
@@ -2943,7 +3046,7 @@ async function playNext(guild, textChannelId, state = getGuildState(guild)) {
 
   try {
     // LRCLIB fetch runs in parallel (uses album timing, fast).
-    let lyrP = fetchLyrics(next.title, next.durationSec).catch(() => null);
+    let lyrP = (next.isFile || next.isLive) ? Promise.resolve(null) : fetchLyrics(next.title, next.durationSec).catch(() => null);
     const oldTitle = next.title;
     // Use unified playback helper; this will throw on resolution errors.
     const { pageUrl } = await startPlayback(guild, next, state, true);
@@ -2951,7 +3054,7 @@ async function playNext(guild, textChannelId, state = getGuildState(guild)) {
 
     // Link plays start with title = the URL; wait briefly for the parallel
     // metadata resolve (audio is already playing, so this delays nothing).
-    if (isUrl(next.title) || next.title === oldTitle && isUrl(oldTitle)) {
+    if (!next.isLive && !next.isFile && (isUrl(next.title) || next.title === oldTitle && isUrl(oldTitle))) {
       for (let i = 0; i < 16 && (isUrl(next.title) || !next.durationSec); i++) {
         await new Promise((r) => setTimeout(r, 500));
         if (stale()) return;
@@ -2969,7 +3072,7 @@ async function playNext(guild, textChannelId, state = getGuildState(guild)) {
       }
     }
     // Refetch with the real title + duration so LRCLIB picks the right version.
-    if (next.title !== oldTitle || next.durationSec) {
+    if (!next.isFile && !next.isLive && (next.title !== oldTitle || next.durationSec)) {
       lyrP = fetchLyrics(next.title, next.durationSec).catch(() => null);
     }
     
@@ -2993,14 +3096,16 @@ async function playNext(guild, textChannelId, state = getGuildState(guild)) {
     // YouTube subtitle fetch: perfectly synced to the video timing.
     // This can take 30-40s if YouTube throttles yt-dlp, so we run it completely
     // asynchronously in the background without blocking the song from starting!
-    fetchYouTubeLyrics(next.videoUrl || next.source).then(async (ytSub) => {
-      if (stale() || state.current !== next) return; // Song changed while downloading
-      if (ytSub && ytSub.synced?.length) {
-        logPretty("INFO", "YouTube subtitles arrived (video-synced), swapping lyrics");
-        state.currentLyrics = ytSub;
-        await refreshNpControls(guild, state);
-      }
-    }).catch(() => null);
+    if (!next.isFile && !next.isLive) {
+      fetchYouTubeLyrics(next.videoUrl || next.source).then(async (ytSub) => {
+        if (stale() || state.current !== next) return; // Song changed while downloading
+        if (ytSub && ytSub.synced?.length) {
+          logPretty("INFO", "YouTube subtitles arrived (video-synced), swapping lyrics");
+          state.currentLyrics = ytSub;
+          await refreshNpControls(guild, state);
+        }
+      }).catch(() => null);
+    }
 
   } catch (e) {
     if (stale()) { // put the song back — the newer flow owns the queue now
@@ -3118,6 +3223,16 @@ async function startPlayback(guild, item, state, stayPut = false) {
   // Ensure the bot is connected to the correct voice channel and subscribed to the player
   ensureVC(guild, item.voiceChannelId, state, { stay: stayPut });
 
+  // Stream directly from a local or uploaded audio file
+  if (item.isFile && item.filePath) {
+    if (!fs.existsSync(item.filePath)) {
+      throw new Error(`Audio file not found: ${path.basename(item.filePath)}`);
+    }
+    const pipeObj = spawnFfmpegFilePipe(item.filePath, consumeOffset(item, state));
+    await playPipe(guild, item, state, pipeObj);
+    return { pageUrl: null };
+  }
+
   // Resolve source: convert Spotify track → search query if needed.
   // For everything else (YouTube URL, search text, SoundCloud URL etc.)
   // we pass it straight to yt-dlp which handles search internally.
@@ -3131,6 +3246,12 @@ async function startPlayback(guild, item, state, stayPut = false) {
   } else if (!isUrl(source)) {
     // Plain text search query — prefix with ytsearch so yt-dlp searches YouTube
     source = `ytsearch1:${sanitizeSearchQuery(source)}`;
+  }
+
+  // Live stream handling
+  if (item.isLive) {
+    await playPipe(guild, item, state, spawnUniversalPipe(source, item.altClient || undefined, 0, true));
+    return { pageUrl: source };
   }
 
   // TikTok: metadata via TikWM. Audio is streamed via Cloudflare Worker proxy
@@ -3276,6 +3397,25 @@ client.on("interactionCreate", async (itx) => {
       });
       const filtered = choices.filter(choice => choice.name.toLowerCase().includes(focusedValue)).slice(0, 25);
       await itx.respond(filtered);
+      return;
+    }
+    if (itx.commandName === "stm") {
+      try {
+        const focusedValue = (itx.options.getFocused() || "").toString().toLowerCase();
+        const assetsDir = path.resolve(__dirname, "Assets");
+        if (fs.existsSync(assetsDir)) {
+          const files = fs.readdirSync(assetsDir).filter(f => {
+            const ext = path.extname(f).toLowerCase();
+            return [".mp3", ".wav", ".ogg", ".flac", ".m4a", ".aac", ".opus", ".webm", ".wma"].includes(ext);
+          });
+          const choices = files
+            .filter(f => f.toLowerCase().includes(focusedValue))
+            .slice(0, 25)
+            .map(f => ({ name: f.length > 100 ? f.slice(0, 97) + "..." : f, value: f }));
+          return await itx.respond(choices);
+        }
+      } catch { }
+      return await itx.respond([]);
     }
     return;
   }
@@ -3675,7 +3815,12 @@ client.on("interactionCreate", async (itx) => {
     const meta = await metaP;
     if (meta.title && meta.title !== q) item.title = meta.title;
     if (meta.thumb) item.thumb = meta.thumb;
-    if (meta.durationSec) item.durationSec = meta.durationSec;
+    if (meta.isLive) {
+      item.isLive = true;
+      item.durationSec = null;
+    } else if (meta.durationSec) {
+      item.durationSec = meta.durationSec;
+    }
     if (meta.videoUrl) item.videoUrl = meta.videoUrl;
     const addedSlash = makeEmbed(COLORS.success)
       .setDescription(`### ➕ Added to queue`)
@@ -3687,6 +3832,135 @@ client.on("interactionCreate", async (itx) => {
     if (item.thumb) addedSlash.setThumbnail(item.thumb);
     await itx.editReply({ embeds: [addedSlash] });
     return;
+  }
+
+  if (itx.commandName === "stm") {
+    await itx.deferReply({ flags: MessageFlags.Ephemeral });
+    const att = itx.options.getAttachment("file");
+    const localName = itx.options.getString("name");
+
+    if (!att && !localName) {
+      return itx.editReply({
+        embeds: [errorEmbed("Please upload an audio **file** or select a local file **name** from Assets\n**Example:** `/stm file:<attachment>` or `/stm name:<song.mp3>`")]
+      });
+    }
+
+    let filePath = null;
+    let title = null;
+    let durationSec = null;
+
+    if (att) {
+      const allowedExts = [".mp3", ".wav", ".ogg", ".flac", ".m4a", ".aac", ".opus", ".webm", ".wma"];
+      const ext = path.extname(att.name || "").toLowerCase();
+      if (!allowedExts.includes(ext) && !String(att.contentType || "").startsWith("audio/")) {
+        return itx.editReply({
+          embeds: [errorEmbed(`Unsupported file type (${ext || "unknown"}). Allowed: ${allowedExts.join(", ")}`)]
+        });
+      }
+      if (att.size > 100 * 1024 * 1024) {
+        return itx.editReply({ embeds: [errorEmbed("File too large (max 100MB)")] });
+      }
+
+      const uploadsDir = path.join(config.dataDir, "uploads");
+      try { fs.mkdirSync(uploadsDir, { recursive: true }); } catch { }
+      
+      const safeBase = path.basename(att.name || "audio.mp3").replace(/[^a-zA-Z0-9._-]/g, "_");
+      filePath = path.join(uploadsDir, `${Date.now()}_${safeBase}`);
+
+      try {
+        const res = await fetch(att.url);
+        if (!res.ok) throw new Error(`HTTP ${res.status} ${res.statusText}`);
+        const { Readable } = require("stream");
+        const { pipeline } = require("stream/promises");
+        await pipeline(Readable.fromWeb(res.body), fs.createWriteStream(filePath));
+      } catch (e) {
+        return itx.editReply({ embeds: [errorEmbed("Failed to download attachment: " + (e?.message || e))] });
+      }
+
+      title = att.name || safeBase;
+      const meta = await resolveAudioFileMeta(filePath);
+      durationSec = meta.durationSec;
+    } else if (localName) {
+      const assetsDir = path.resolve(__dirname, "Assets");
+      const safePath = path.resolve(assetsDir, localName);
+      if (!safePath.startsWith(assetsDir) || !fs.existsSync(safePath)) {
+        return itx.editReply({ embeds: [errorEmbed(`File \`${localName}\` not found in Assets folder`)] });
+      }
+      const st = fs.statSync(safePath);
+      if (!st.isFile()) {
+        return itx.editReply({ embeds: [errorEmbed("Target is not a valid file")] });
+      }
+
+      filePath = safePath;
+      title = path.basename(safePath);
+      const meta = await resolveAudioFileMeta(filePath);
+      durationSec = meta.durationSec;
+    }
+
+    const item = {
+      title,
+      source: filePath,
+      filePath,
+      isFile: true,
+      durationSec,
+      requestedBy: itx.user.tag,
+      guild: itx.guild,
+      voiceChannelId: userVC,
+      textChannelId: itx.channelId,
+    };
+
+    state.queue.push(item);
+    const shouldStart = !state.current;
+    if (shouldStart) playNext(itx.guild, itx.channelId, state);
+
+    const durStr = durationSec ? fmtTime(durationSec) : "Unknown duration";
+    const addedSlash = makeEmbed(COLORS.success)
+      .setDescription(`### 📁 Stream from File Added`)
+      .addFields(
+        { name: "🎵 Audio Track", value: `**${cleanTitle(item.title)}**`, inline: false },
+        { name: "⏱️ Duration", value: `\`${durStr}\``, inline: true },
+        { name: "📋 Queue position", value: `\`#${state.queue.length}\``, inline: true },
+        { name: "👤 Requested by", value: `${itx.user}`, inline: true },
+      );
+    return itx.editReply({ embeds: [addedSlash] });
+  }
+
+  if (itx.commandName === "live") {
+    await itx.deferReply({ flags: MessageFlags.Ephemeral });
+    const rawUrl = itx.options.getString("url", true).trim();
+    const cleanUrl = sanitizeSearchQuery(rawUrl);
+
+    const item = {
+      title: cleanUrl,
+      source: cleanUrl,
+      isLive: true,
+      durationSec: null,
+      requestedBy: itx.user.tag,
+      guild: itx.guild,
+      voiceChannelId: userVC,
+      textChannelId: itx.channelId,
+    };
+
+    state.queue.push(item);
+    const shouldStart = !state.current;
+    const metaP = resolveTitleAndThumb(cleanUrl);
+    if (shouldStart) playNext(itx.guild, itx.channelId, state);
+    const meta = await metaP;
+    if (meta.title && meta.title !== cleanUrl) item.title = meta.title;
+    if (meta.thumb) item.thumb = meta.thumb;
+    item.durationSec = null;
+    if (meta.videoUrl) item.videoUrl = meta.videoUrl;
+
+    const addedLive = makeEmbed(COLORS.music)
+      .setDescription(`### 🔴 Live Stream Added`)
+      .addFields(
+        { name: "📡 Broadcast", value: `**${cleanTitle(item.title)}**`, inline: false },
+        { name: "🔴 Status", value: "`• LIVE`", inline: true },
+        { name: "📋 Queue position", value: `\`#${state.queue.length}\``, inline: true },
+        { name: "👤 Requested by", value: `${itx.user}`, inline: true },
+      );
+    if (item.thumb) addedLive.setThumbnail(item.thumb);
+    return itx.editReply({ embeds: [addedLive] });
   }
 
   if (itx.commandName === "skip") {
