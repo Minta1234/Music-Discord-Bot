@@ -884,17 +884,17 @@ function buildPanelEmbed(guild) {
   const next = st.queue.slice(0, 3).map((x, i) => `\`${i + 1}.\` ${x.title}`).join("\n") || "—";
   const ck = ytCookiesStatus();
   const room = getSavedControlChannel(guild.id) ? `<#${getSavedControlChannel(guild.id)}>` : "#bocchi (auto)";
-  const panel = new EmbedBuilder().setColor(0x5865F2).setTitle("🎛 Music Panel — Settings")
-    .setDescription("Press the buttons — you must share a voice channel with the bot\nAll bot messages live in " + room)
+  const panel = new EmbedBuilder().setColor(0xE8B34C).setAuthor({ name: "Bocchi Control Desk", iconURL: guild.client.user.displayAvatarURL() })
+    .setDescription("Use the interactive buttons below to control playback.\n" + `All bot messages live in ${room}`)
     .addFields(
-      { name: "🎵 Now", value: cur, inline: false },
-      { name: "📋 Next", value: next, inline: false },
-      { name: "🔊 Volume", value: `${st.volumePct}%`, inline: true },
-      { name: "🔁 Loop", value: loopLabel(st.loopMode), inline: true },
-      { name: "📝 Lyrics", value: st.showLyrics !== false ? "On" : "Off", inline: true },
-      { name: "🎛 Controls", value: st.showControls !== false ? "Show" : "Hidden", inline: true },
-      { name: " Room", value: room, inline: true },
-      { name: "🍪 YouTube", value: ck.exists ? `✅ signed in (${ck.size}b)` : "❌ not signed — admin, use `/ytsignin`", inline: true },
+      { name: "✨ Now Playing", value: cur, inline: false },
+      { name: "💿 Up Next", value: next, inline: false },
+      { name: "🔊 Volume", value: `\`${st.volumePct}%\``, inline: true },
+      { name: "🔁 Loop", value: `\`${loopLabel(st.loopMode)}\``, inline: true },
+      { name: "📝 Lyrics", value: `\`${st.showLyrics !== false ? "On" : "Off"}\``, inline: true },
+      { name: "🎛 Controls", value: `\`${st.showControls !== false ? "Show" : "Hidden"}\``, inline: true },
+      { name: "📡 Room", value: room, inline: true },
+      { name: "🍪 YouTube", value: ck.exists ? `\`✅ Signed In\`` : "`❌ Not Signed In`", inline: true },
     ).setTimestamp();
   const pt = st.current ? (st.current.thumb || thumbFor(st.current.source)) : null;
   if (pt) panel.setThumbnail(pt);
@@ -1204,8 +1204,8 @@ function progressLine(state) {
   const el = playbackSeconds(state);
   if (!Number.isFinite(dur) || !dur || dur <= 0) return `▶ ${fmtTime(el)} • LIVE`;
   const p = Math.max(0, Math.min(1, el / dur));
-  const w = 12, fill = Math.round(p * w);
-  return `${"█".repeat(fill)}${"░".repeat(w - fill)} ${fmtTime(el)} / ${fmtTime(dur)}`;
+  const w = 18, fill = Math.round(p * w);
+  return `${"▬".repeat(fill)}⚪${"▬".repeat(w - fill)} \`${fmtTime(el)} / ${fmtTime(dur)}\``;
 }
 // Lyrics via LRCLIB (free, no key). Cached per title. Returns plain text plus
 // timestamped `synced` lines for karaoke scrolling, or null when missing.
@@ -1457,19 +1457,15 @@ function buildNowPlayingEmbed(state, lyrics) {
   const cur = state.current;
   const dur = cur?.durationSec;
   const scrollingTitle = marqueeText(cleanTitle(cur?.title, 180), playbackSeconds(state));
-  const e = makeEmbed(COLORS.music)
-    .setTitle("🎶 Now Playing")
-    .setDescription(`**${scrollingTitle}**${Number.isFinite(dur) && dur > 0 ? ` — ${fmtTime(dur)}` : ""}\n${progressLine(state)}`)
-    .addFields(
-      { name: "👤 Requested by", value: `${cur?.requestedBy || "—"}`, inline: true },
-      { name: "🔊 Volume", value: `${state.volumePct}%`, inline: true },
-      { name: "🔁 Loop", value: loopLabel(state.loopMode), inline: true },
-    )
-    .setFooter({ text: "Use the controls below" })
+  const e = makeEmbed(0xE8B34C)
+    .setAuthor({ name: "Now Playing", iconURL: "https://raw.githubusercontent.com/discordjs/discord.js/main/docs/favicon.ico" })
+    .setTitle(scrollingTitle)
+    .setDescription(`${Number.isFinite(dur) && dur > 0 ? `\`${fmtTime(dur)}\` ` : ""}${progressLine(state)}\n\n**Requested by:** ${cur?.requestedBy || "—"} | **Vol:** ${state.volumePct}% | **Loop:** ${loopLabel(state.loopMode)}`)
+    .setFooter({ text: "Bocchi Music System", iconURL: cur?.thumb || null })
     .setTimestamp();
   if (cur?.source && isUrl(cur.source)) e.setURL(cur.source);
   const t = cur ? (cur.thumb || thumbFor(cur.source)) : null;
-  if (t) e.setThumbnail(t);
+  if (t) e.setImage(t); // Large premium banner
   if (lyrics && lyrics.text) {
     let synced = Array.isArray(lyrics.synced) ? lyrics.synced : [];
     let estimated = false;
@@ -1518,8 +1514,13 @@ function startNowPlayingTicker(guild, state) {
 // so a stale setting can never keep bot messages out of #bocchi.
 const bocchiCreateCooldown = new Map();
 async function resolveBotTextChannel(guild, fallbackId) {
+  const savedId = getSavedControlChannel(guild.id);
+  if (savedId) {
+    const ch = guild.channels.cache.get(savedId);
+    if (ch && ch.type === ChannelType.GuildText) return ch;
+  }
   const bocchi = guild.channels.cache.find((c) =>
-    c.type === ChannelType.GuildText && c.name.toLowerCase() === "bocchi");
+    c.type === ChannelType.GuildText && (c.name.toLowerCase() === "bocchi" || c.name.toLowerCase() === "boochi"));
   if (bocchi) {
     if (getSavedControlChannel(guild.id) !== bocchi.id) {
       try { setSavedControlChannel(guild.id, bocchi.id); } catch { }
@@ -1553,7 +1554,6 @@ async function resolveBotTextChannel(guild, fallbackId) {
       logPretty("WARN", `Could not create #bocchi in ${guild.name}: ${e?.message || e}`);
     }
   }
-  const savedId = getSavedControlChannel(guild.id);
   const saved = savedId ? guild.channels.cache.get(savedId) : null;
   if (saved?.isTextBased?.()) return saved;
   const fb = fallbackId ? guild.channels.cache.get(fallbackId) : null;
@@ -4809,9 +4809,9 @@ if(window.AOS)AOS.init({once:true,duration:520,offset:22,disable:window.matchMed
 function dashPlayerPageTailwind() {
   return '<!doctype html><html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>Bocchi · Web Player</title>'
     + '<script src="https://cdn.tailwindcss.com"></script><link href="https://unpkg.com/aos@2.3.4/dist/aos.css" rel="stylesheet">'
-    + '<style>body{background-color:#090c10;background-image:linear-gradient(rgba(255,255,255,.025) 1px,transparent 1px),linear-gradient(90deg,rgba(255,255,255,.025) 1px,transparent 1px);background-size:32px 32px}input:focus,select:focus{outline:2px solid #e8b34c;outline-offset:2px}::-webkit-scrollbar{width:6px;height:6px}::-webkit-scrollbar-track{background:transparent}::-webkit-scrollbar-thumb{background:#27272a;border-radius:3px}::-webkit-scrollbar-thumb:hover{background:#3f3f46}@keyframes live-pulse{0%,100%{opacity:1}50%{opacity:.4}}#live-dot{animation:live-pulse 1.5s ease-in-out infinite}</style></head><body class="min-h-screen text-zinc-100 antialiased">'
+    + '<style>:root{--mood-color:#090c10;--mood-glow:rgba(232,179,76,0.05)} body{background-color:var(--mood-color);background-image:radial-gradient(ellipse at 50% 0%,var(--mood-glow),transparent 70%),linear-gradient(rgba(255,255,255,.025) 1px,transparent 1px),linear-gradient(90deg,rgba(255,255,255,.025) 1px,transparent 1px);background-size:100% 100%,32px 32px,32px 32px;transition:background-color 1.5s ease}input:focus,select:focus{outline:2px solid #e8b34c;outline-offset:2px}::-webkit-scrollbar{width:6px;height:6px}::-webkit-scrollbar-track{background:transparent}::-webkit-scrollbar-thumb{background:#27272a;border-radius:3px}::-webkit-scrollbar-thumb:hover{background:#3f3f46}@keyframes live-pulse{0%,100%{opacity:1}50%{opacity:.4}}#live-dot{animation:live-pulse 1.5s ease-in-out infinite}</style></head><body class="min-h-screen text-zinc-100 antialiased" style="transition: background-color 1s ease;">'
     + '<main class="mx-auto max-w-5xl px-4 py-6 sm:px-6 sm:py-10"><header class="mb-8 flex flex-wrap items-center justify-between gap-4 border-b border-white/10 pb-5" data-aos="fade-down"><div class="flex items-center gap-3"><span class="grid h-10 w-10 place-items-center bg-amber-300 text-xl font-black text-zinc-950">♪</span><div><p class="text-sm font-semibold">Bocchi player</p><p class="font-mono text-[10px] text-zinc-500">LISTENING ROOM</p></div></div><div class="flex flex-wrap items-center gap-2"><a class="px-3 py-2 text-xs text-zinc-400 hover:text-amber-200" href="/dashboard">← Control desk</a><select id="srv" class="border border-white/10 bg-[#10151b] px-3 py-2 text-sm"></select><select id="chn" class="border border-white/10 bg-[#10151b] px-3 py-2 text-sm"></select><button class="border border-white/15 px-3 py-2 text-xs hover:border-amber-300" onclick="P.join()">Join voice</button><button class="border border-white/15 px-3 py-2 text-xs hover:border-rose-300" onclick="P.leave()">Leave</button></div></header>'
-    + '<section class="grid gap-6 md:grid-cols-[minmax(0,1.2fr)_minmax(280px,.8fr)] items-start" data-aos="fade-up"><div class="border border-white/10 bg-[#10151b] p-4 sm:p-6"><div id="cover-wrap" class="mb-5 aspect-video w-full overflow-hidden border border-white/10 bg-gradient-to-br from-zinc-900 via-zinc-800 to-zinc-900 flex items-center justify-center"><img id="cover" class="h-full w-full object-cover hidden" alt="Album art" onerror="this.classList.add(\'hidden\');document.getElementById(\'cover-ph\').classList.remove(\'hidden\')"><div id="cover-ph" class="flex flex-col items-center gap-2 text-zinc-600"><span class="text-5xl">♪</span><span class="text-xs font-mono">NO ART</span></div></div><p class="font-mono text-[10px] uppercase text-amber-300">Now playing</p><h1 id="ttl" class="mt-2 break-words text-2xl font-semibold sm:text-3xl">— idle —</h1><p id="by" class="mt-2 text-sm text-zinc-400"></p>'
+    + '<section class="grid gap-6 md:grid-cols-[minmax(0,1.2fr)_minmax(280px,.8fr)] items-start" data-aos="fade-up"><div class="border border-white/10 bg-[#10151b] p-4 sm:p-6"><div id="cover-wrap" class="mb-5 aspect-video w-full overflow-hidden border border-white/10 bg-gradient-to-br from-zinc-900 via-zinc-800 to-zinc-900 flex items-center justify-center"><img id="cover" crossorigin="anonymous" onload="window.extractMood&&window.extractMood(this)" class="h-full w-full object-cover hidden" alt="Album art" onerror="this.classList.add(\'hidden\');document.getElementById(\'cover-ph\').classList.remove(\'hidden\')"><div id="cover-ph" class="flex flex-col items-center gap-2 text-zinc-600"><span class="text-5xl">♪</span><span class="text-xs font-mono">NO ART</span></div></div><p class="font-mono text-[10px] uppercase text-amber-300">Now playing</p><h1 id="ttl" class="mt-2 break-words text-2xl font-semibold sm:text-3xl">— idle —</h1><p id="by" class="mt-2 text-sm text-zinc-400"></p>'
     + '<div id="lyrics-container" class="mt-6 h-56 overflow-y-auto scroll-smooth rounded bg-[#090c10] p-4 text-center font-medium leading-loose text-zinc-400 hidden shadow-inner border border-white/5" style="-webkit-mask-image: linear-gradient(transparent, black 15%, black 85%, transparent); mask-image: linear-gradient(transparent, black 15%, black 85%, transparent);"></div>'
     + '<div class="mt-5"><div id="timebar" class="h-2 cursor-pointer rounded-full bg-white/10" title="Click to seek"><div id="tfill" class="h-full w-0 rounded-full bg-amber-300"></div></div><div class="mt-1 flex justify-between font-mono text-[11px] text-zinc-500"><span id="tcur">0:00</span><span id="tdur">• LIVE</span></div></div>'
     + '<div class="mt-6 flex flex-wrap items-center gap-2"><button class="h-11 w-12 border border-white/10 text-lg hover:border-amber-300" onclick="P.ctl(\'prev\')" title="Previous">⏮</button><button id="pp" class="h-11 w-12 bg-amber-300 text-lg text-zinc-950 hover:bg-amber-200" onclick="P.toggle()" title="Play or pause">▶️</button><button class="h-11 w-12 border border-white/10 text-lg hover:border-amber-300" onclick="P.ctl(\'skip\')" title="Skip">⏭</button><button class="h-11 w-12 border border-rose-400/30 text-lg text-rose-300 hover:bg-rose-400/10" onclick="P.ctl(\'stop\')" title="Stop">■</button><div class="ml-auto flex items-center gap-2"><button class="h-11 w-12 border border-white/10 text-lg hover:border-amber-300" onclick="document.getElementById(\'q\').scrollIntoView({behavior:\'smooth\'})" title="List">📋</button><button id="loopb" class="h-11 border border-white/10 px-3 text-xs hover:border-amber-300" onclick="P.loop()">Loop · Off</button></div></div>'
@@ -4819,6 +4819,7 @@ function dashPlayerPageTailwind() {
     + '<aside class="border border-white/10 bg-[#10151b] p-4 sm:p-6 md:sticky md:top-6 md:max-h-[calc(100vh-3rem)] md:overflow-y-auto" data-aos="fade-up" data-aos-delay="100"><div class="mb-4 flex items-end justify-between"><div><p class="font-mono text-[10px] uppercase text-zinc-500">Next tracks</p><h2 class="mt-1 text-lg font-semibold">Up next</h2></div><span class="text-amber-300">☷</span></div><ol id="q" class="divide-y divide-white/5 text-sm text-zinc-300"></ol></aside></section></main>'
     + '<script src="https://unpkg.com/aos@2.3.4/dist/aos.js"></script><script>'
     + 'var PG={g:[],id:"",snap:null,snapAt:0};'
+    + 'window.extractMood=function(img){try{var c=document.createElement("canvas"),ctx=c.getContext("2d");c.width=64;c.height=64;ctx.drawImage(img,0,0,64,64);var d=ctx.getImageData(0,0,64,64).data,r=0,g=0,b=0,count=0;for(var i=0;i<d.length;i+=16){r+=d[i];g+=d[i+1];b+=d[i+2];count++;}r=Math.floor(r/count*0.15);g=Math.floor(g/count*0.15);b=Math.floor(b/count*0.15);document.documentElement.style.setProperty("--mood-color","rgb("+r+","+g+","+b+")");document.documentElement.style.setProperty("--mood-glow","rgba("+Math.floor(r*6)+","+Math.floor(g*6)+","+Math.floor(b*6)+",0.15)");}catch(e){}};'
     + 'function say(t){document.getElementById("msg").textContent=t;}'
     + 'function gid(){var s=document.getElementById("srv");return s&&s.value?s.value:"";}'
     + 'async function api(p,d){var r=await fetch(p,{method:d?"POST":"GET",headers:{"Content-Type":"application/json"},body:d?JSON.stringify(d):undefined});var j=null;try{j=await r.json();}catch(e){}if(!r.ok||(j&&j.error))throw new Error((j&&j.error)||("HTTP "+r.status));return j;}'
@@ -4956,8 +4957,11 @@ function startDashboard() {
         res.writeHead(200, { "Content-Type": "text/html; charset=utf-8" }); res.end(html); return;
       }
       if (!dashIsAuthed(req)) {
-        if (p.startsWith("/api/")) { res.writeHead(401, { "Content-Type": "application/json" }); res.end(JSON.stringify({ error: "unauthorized" })); return; }
-        res.writeHead(302, { Location: "/login" }); res.end(); return;
+        const isPublicPath = p === "/player" || p.startsWith("/api/");
+        if (!isPublicPath) {
+          if (p.startsWith("/api/")) { res.writeHead(401, { "Content-Type": "application/json" }); res.end(JSON.stringify({ error: "unauthorized" })); return; }
+          res.writeHead(302, { Location: "/login" }); res.end(); return;
+        }
       }
       if (p === "/dashboard" && req.method === "GET") {
         res.writeHead(200, { "Content-Type": "text/html; charset=utf-8" });
@@ -5044,6 +5048,7 @@ function startDashboard() {
         fs.writeFileSync(target, text.replace(/\r\n/g, "\n"), "utf8");
         config.cookieFile = target; // live update, no restart needed
         logPretty("SYSTEM", "YouTube cookies updated via dashboard", { tail: `${text.length} chars -> ${target}` });
+        try { client.guilds.cache.forEach(async g => { try { const state = getGuildState(g); const panel = state.current ? buildNowPlayingEmbed(state, state.currentLyrics) : buildPanelEmbed(g); if(state.npMessage) await upsertNpMessage(g, state.npMessage.channelId, panel, true); } catch(e){} }); } catch(e){}
         res.writeHead(302, { Location: "/dashboard?msg=" + encodeURIComponent("✅ Cookies saved to " + target + " — try /play again") }); res.end(); return;
       }
       if (p === "/cookies/clear" && req.method === "POST") {
@@ -5051,6 +5056,7 @@ function startDashboard() {
         try { fs.unlinkSync(target); } catch { }
         if (!process.env.YTDLP_COOKIES_PATH) config.cookieFile = null;
         logPretty("SYSTEM", "YouTube cookies removed via dashboard");
+        try { client.guilds.cache.forEach(async g => { try { const state = getGuildState(g); const panel = state.current ? buildNowPlayingEmbed(state, state.currentLyrics) : buildPanelEmbed(g); if(state.npMessage) await upsertNpMessage(g, state.npMessage.channelId, panel, true); } catch(e){} }); } catch(e){}
         res.writeHead(302, { Location: "/dashboard?msg=" + encodeURIComponent("Cookies removed") }); res.end(); return;
       }
       if (p === "/ytdlp-update" && req.method === "POST") {

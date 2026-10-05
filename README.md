@@ -103,7 +103,7 @@ node bot.js
 | `/setaip` | Open a private temporary AI chat thread |
 | `/delete` | Delete your private AI chat thread |
 | `/deletep confirm:true` | Delete all messages in the public AI chat |
-| `/clear` | Clear all AI history on this server |
+| `/clear` | Clear all AI history on this server(#bocchi) |
 
 ### 🛠️ Utility
 
