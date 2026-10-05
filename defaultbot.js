@@ -97,7 +97,7 @@ async function askGemini(question, history = [], persona = "") {
     if (config.openRouterApiKey) return askOpenRouter(question, history, persona);
     throw new Error("Gemini quota limit reached. Please try again after the cooldown.");
   }
-  const models = ["gemini-3.8-flash", "gemini-3.5-flash-lite"];
+  const models = ["gemini-1.5-flash-latest", "gemini-1.5-flash"];
   let geminiError = null;
   for (let i = 0; i < models.length; i++) {
     const controller = new AbortController();

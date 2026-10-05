@@ -4,8 +4,8 @@
   "description": "Discord Music Bot — YouTube, Spotify, TikTok, SoundCloud",
   "main": "bot.js",
   "scripts": {
-    "start": "node bot.js",
-    "dev": "node --watch bot.js"
+    "start": "node --no-deprecation bot.js",
+    "dev": "node --no-deprecation --watch bot.js"
   },
   "engines": {
     "node": ">=18.0.0"
@@ -19,12 +19,15 @@
   "author": "",
   "license": "ISC",
   "dependencies": {
+    "@discordjs/opus": "^0.10.0",
     "@discordjs/voice": "^0.19.0",
     "@snazzah/davey": "^0.1.7",
     "discord.js": "^14.22.1",
     "dotenv": "^17.2.2",
     "ffmpeg-static": "^5.3.0",
+    "libsodium-wrappers": "^0.8.4",
     "opusscript": "^0.0.8",
+    "tweetnacl": "^1.0.3",
     "yt-dlp-exec": "^1.0.2"
   }
 }

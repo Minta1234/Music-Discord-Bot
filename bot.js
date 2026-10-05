@@ -2,7 +2,44 @@
 require("dotenv").config();
 const path = require("path");
 const fs = require("fs");
+const os = require("os");
 const crypto = require("crypto");
+
+// --- Single-instance guard ---
+// Two copies of the bot logged in with the same token fight over the voice
+// connection (endless signalling<->connecting, "Cannot perform IP discovery"),
+// answer every interaction twice ("Unknown interaction") and nothing plays.
+// The newest launch wins: an older bot.js still running is terminated.
+(function singleInstanceGuard() {
+  const pidFile = path.join(__dirname, "data", "bot.pid");
+  try {
+    const oldPid = parseInt(fs.readFileSync(pidFile, "utf8"), 10);
+    if (oldPid && oldPid !== process.pid) {
+      let alive = false;
+      try { process.kill(oldPid, 0); alive = true; } catch { }
+      if (alive) {
+        let isNode = true;
+        if (process.platform === "win32") {
+          try {
+            const out = require("child_process").execSync(`tasklist /FI "PID eq ${oldPid}" /FO CSV /NH`, { encoding: "utf8" });
+            isNode = /node\.exe/i.test(out);
+          } catch { isNode = false; }
+        }
+        if (isNode) {
+          console.warn(`[guard] Another bot instance (PID ${oldPid}) is running - stopping it.`);
+          try { process.kill(oldPid, "SIGKILL"); } catch { }
+        }
+      }
+    }
+  } catch { }
+  try {
+    fs.mkdirSync(path.dirname(pidFile), { recursive: true });
+    fs.writeFileSync(pidFile, String(process.pid));
+  } catch { }
+  process.on("exit", () => {
+    try { if (fs.readFileSync(pidFile, "utf8").trim() === String(process.pid)) fs.unlinkSync(pidFile); } catch { }
+  });
+})();
 
 // --- Spotify link support (no direct Spotify audio streaming) ---
 // Accept Spotify TRACK/EPISODE URLs/URIs and convert to a YouTube search query.
@@ -113,7 +150,7 @@ async function askGemini(question, history = [], persona = "") {
     if (config.openRouterApiKey) return askOpenRouter(question, history, persona);
     throw new Error("Gemini quota limit reached. Please try again after the cooldown.");
   }
-  const models = ["gemini-flash-latest", "gemini-3.8-flash"];
+  const models = ["gemini-1.5-flash-latest", "gemini-1.5-flash"];
   let geminiError = null;
   for (let i = 0; i < models.length; i++) {
     const controller = new AbortController();
@@ -276,7 +313,13 @@ async function tiktokMetaOnce(pageUrl) {
   // TikWM proxy URL works from any IP (incl. cloud/Railway);
   // TikTok CDN URL (music) is blocked on datacenter IPs.
   const proxyAudioUrl = videoId ? `https://www.tikwm.com/video/music/${videoId}.mp3` : null;
-  return { title: String(title), thumb, audioUrl: String(music), proxyAudioUrl, videoId, duration: d.duration || null, author };
+  // The no-watermark video (faststart MP4) carries the REAL audio heard on
+  // TikTok. The "sound" file above is often only a short snippet of a library
+  // song (e.g. 8s for a 30s clip), so playback would stop early.
+  const rawVideo = d.play || d.wmplay || d.hdplay || null;
+  const videoUrl = rawVideo ? (String(rawVideo).startsWith("http") ? String(rawVideo) : "https://www.tikwm.com" + rawVideo) : null;
+  const musicDuration = Number(d.music_info && d.music_info.duration) || null;
+  return { title: String(title), thumb, audioUrl: String(music), proxyAudioUrl, videoUrl, videoId, duration: d.duration || null, musicDuration, author };
 }
 function tiktokHeaders() {
   return "User-Agent: Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/126.0 Safari/537.36\r\n"
@@ -471,6 +514,9 @@ const {
   InviteTargetType,
   MessageFlags,
   ChannelType,
+  ModalBuilder,
+  TextInputBuilder,
+  TextInputStyle,
 } = require("discord.js");
 const {
   joinVoiceChannel,
@@ -787,24 +833,6 @@ function isGuildAdmin(member) {
     return member.permissions?.has?.(PermissionFlagsBits.ManageGuild);
   } catch { return false; }
 }
-function buildTransportRows(state = null) {
-  const paused = state?.player?.state?.status === AudioPlayerStatus.Paused;
-  const r1 = new ActionRowBuilder().addComponents(
-    new ButtonBuilder().setCustomId("mus_prev").setLabel("Prev").setEmoji("⏮").setStyle(ButtonStyle.Secondary),
-    new ButtonBuilder().setCustomId("mus_resume").setLabel(paused ? "Play" : "Pause").setEmoji(paused ? "▶" : "⏸").setStyle(paused ? ButtonStyle.Success : ButtonStyle.Secondary),
-    new ButtonBuilder().setCustomId("mus_skip").setLabel("Skip").setEmoji("⏭").setStyle(ButtonStyle.Primary),
-    new ButtonBuilder().setCustomId("mus_stop").setLabel("Stop").setEmoji("⏹").setStyle(ButtonStyle.Danger),
-    new ButtonBuilder().setCustomId("mus_queue").setLabel("List").setEmoji("📋").setStyle(ButtonStyle.Secondary),
-  );
-  const lyricsOn = state ? state.showLyrics !== false : true;
-  const r2 = new ActionRowBuilder().addComponents(
-    new ButtonBuilder().setCustomId("mus_loop").setLabel(`Loop: ${state ? loopLabel(state.loopMode).replace(/^[^\s]+\s/, "") : "Off"}`).setEmoji("🔁").setStyle(ButtonStyle.Secondary),
-    new ButtonBuilder().setCustomId("mus_lyrics").setLabel(`Lyrics: ${lyricsOn ? "On" : "Off"}`).setEmoji("📝").setStyle(ButtonStyle.Secondary),
-    new ButtonBuilder().setCustomId("mus_volup").setLabel("Vol +").setEmoji("🔊").setStyle(ButtonStyle.Secondary),
-    new ButtonBuilder().setCustomId("mus_voldown").setLabel("Vol −").setEmoji("🔉").setStyle(ButtonStyle.Secondary),
-  );
-  return [r1, r2];
-}
 // Setup is done once the guild has both bocchi rooms (text + saved voice).
 function isBocchiSetup(state) {
   const guild = state?.guildId ? client.guilds.cache.get(state.guildId) : null;
@@ -813,24 +841,41 @@ function isBocchiSetup(state) {
     c.type === ChannelType.GuildText && c.name.toLowerCase() === "bocchi");
   return hasText && !!getSavedMusicVoice(guild.id);
 }
-// Settings row: always visible so a hidden-controls panel can be reopened.
-// The /setup button hides itself once the bocchi rooms already exist.
-function buildSettingsRow(state = null) {
-  const shown = !state || state.showControls !== false;
-  const row = new ActionRowBuilder().addComponents(
-    new ButtonBuilder().setCustomId("mus_controls").setLabel(`Controls: ${shown ? "Show" : "Hidden"}`).setEmoji("🎛").setStyle(ButtonStyle.Secondary),
-  );
-  if (!isBocchiSetup(state)) {
-    row.addComponents(new ButtonBuilder().setCustomId("mus_setup").setLabel("/setup").setEmoji("🛠").setStyle(ButtonStyle.Secondary));
-  }
-  return row;
-}
 function buildControlRows(state = null) {
   const rows = [];
-  const [r1, r2] = buildTransportRows(state);
+  const paused = state?.player?.state?.status === AudioPlayerStatus.Paused;
+  const shown = !state || state.showControls !== false;
+
+  // Row 1: Minimal main controls
+  const r1 = new ActionRowBuilder().addComponents(
+    new ButtonBuilder().setCustomId("mus_resume").setEmoji(paused ? "▶" : "⏸").setStyle(paused ? ButtonStyle.Success : ButtonStyle.Secondary),
+    new ButtonBuilder().setCustomId("mus_skip").setEmoji("⏭").setStyle(ButtonStyle.Secondary),
+    new ButtonBuilder().setCustomId("mus_stop").setEmoji("⏹").setStyle(ButtonStyle.Danger),
+    new ButtonBuilder().setCustomId("mus_star").setEmoji("⭐").setStyle(ButtonStyle.Secondary),
+    new ButtonBuilder().setCustomId("mus_controls").setEmoji("🎛").setStyle(ButtonStyle.Secondary),
+  );
   rows.push(r1);
-  if (!state || state.showControls !== false) rows.push(r2);
-  rows.push(buildSettingsRow(state));
+
+  // Row 2: Extra controls (hidden by default if minimal is requested, toggled by 🎛)
+  if (shown) {
+    const lyricsOn = state ? state.showLyrics !== false : true;
+    const r2 = new ActionRowBuilder().addComponents(
+      new ButtonBuilder().setCustomId("mus_prev").setLabel("Prev").setEmoji("⏮").setStyle(ButtonStyle.Secondary),
+      new ButtonBuilder().setCustomId("mus_queue").setLabel("List").setEmoji("📋").setStyle(ButtonStyle.Secondary),
+      new ButtonBuilder().setCustomId("mus_loop").setLabel(`Loop: ${state ? loopLabel(state.loopMode).replace(/^[^\s]+\s/, "") : "Off"}`).setEmoji("🔁").setStyle(ButtonStyle.Secondary),
+      new ButtonBuilder().setCustomId("mus_lyrics").setLabel(`Lyrics: ${lyricsOn ? "On" : "Off"}`).setEmoji("📝").setStyle(ButtonStyle.Secondary),
+      new ButtonBuilder().setCustomId("mus_batchplay").setLabel("Batch").setEmoji("📥").setStyle(ButtonStyle.Success),
+    );
+    rows.push(r2);
+  }
+
+  // Row 3: Setup (only if not setup yet)
+  if (!isBocchiSetup(state)) {
+    rows.push(new ActionRowBuilder().addComponents(
+      new ButtonBuilder().setCustomId("mus_setup").setLabel("/setup").setEmoji("🛠").setStyle(ButtonStyle.Secondary)
+    ));
+  }
+
   return rows;
 }
 function buildPanelEmbed(guild) {
@@ -912,7 +957,7 @@ async function handleMusicButton(itx) {
       state.queue.unshift({ title: prev.title, source: prev.source, thumb: prev.thumb || null, durationSec: prev.durationSec || null, requestedBy: prev.requestedBy || itx.user.tag, guild: g, voiceChannelId: userVC, textChannelId: itx.channelId });
       state.skipRequested = true;
       state.prevJump = true;
-      try { state.player.stop(true); } catch {}
+      try { state.player.stop(true); } catch { }
       cleanupCurrentPipeline(state);
       return itx.reply({ content: `⏮ Back to **${cleanTitle(prev.title)}**`, flags: MessageFlags.Ephemeral });
     } catch (e) { return itx.reply({ content: "Previous failed: " + (e?.message || e), flags: MessageFlags.Ephemeral }); }
@@ -954,7 +999,7 @@ async function handleMusicButton(itx) {
   }
   if (id === "mus_controls") {
     state.showControls = !(state.showControls !== false);
-    try { if (state.guildId) setSavedShowControls(state.guildId, state.showControls); } catch {}
+    try { if (state.guildId) setSavedShowControls(state.guildId, state.showControls); } catch { }
     await refreshNpControls(guild, state);
     return itx.reply({ content: state.showControls ? "🎛 Controls Show" : "🎛 Controls hidden — the settings row stays so you can bring them back", flags: MessageFlags.Ephemeral });
   }
@@ -968,12 +1013,27 @@ async function handleMusicButton(itx) {
   }
   if (id === "mus_lyrics") {
     state.showLyrics = !(state.showLyrics !== false);
-    try { if (state.guildId) setSavedShowLyrics(state.guildId, state.showLyrics); } catch {}
+    try { if (state.guildId) setSavedShowLyrics(state.guildId, state.showLyrics); } catch { }
     await refreshNpControls(guild, state);
     return itx.reply({ content: state.showLyrics ? "📝 Karaoke lyrics on — sing along!" : "📝 Lyrics hidden", flags: MessageFlags.Ephemeral });
   }
   if (id === "mus_volup") { setVolumePct(state, (state.volumePct || 100) + 20); return itx.reply({ content: `🔊 ${state.volumePct}%`, flags: MessageFlags.Ephemeral }); }
   if (id === "mus_voldown") { setVolumePct(state, Math.max(0, (state.volumePct || 100) - 20)); return itx.reply({ content: `🔉 ${state.volumePct}%`, flags: MessageFlags.Ephemeral }); }
+  if (id === "mus_star") { return itx.reply({ content: "⭐ Saved to favorites! (Note: feature in development)", flags: MessageFlags.Ephemeral }); }
+  if (id === "mus_batchplay") {
+    const modal = new ModalBuilder()
+      .setCustomId("batch_play_modal")
+      .setTitle("📥 Batch Play — Add Multiple Songs");
+    const linksInput = new TextInputBuilder()
+      .setCustomId("batch_play_links")
+      .setLabel("Paste song links / names (one per line)")
+      .setStyle(TextInputStyle.Paragraph)
+      .setPlaceholder("https://youtube.com/watch?v=...\nhttps://open.spotify.com/track/...\nNever Gonna Give You Up\n...")
+      .setRequired(true)
+      .setMaxLength(4000);
+    modal.addComponents(new ActionRowBuilder().addComponents(linksInput));
+    return itx.showModal(modal);
+  }
   return itx.reply({ content: "?", flags: MessageFlags.Ephemeral });
 }
 
@@ -987,6 +1047,9 @@ function buildHelpEmbedSlash() {
         name: "🎶 Play & queue",
         value: [
           "`/play query:<name/URL>` — Play or queue a song",
+          "`/stm [file:<upload>] [name:<Assets file>]` — Stream audio from file",
+          "`/live url:<stream URL/search>` — Stream live audio (YouTube Live, radio)",
+          "`/batchplay` — Open a form to add multiple songs at once",
           "`/playlist query:<URL/search> limit:<N>` — Load songs in bulk",
           "`/queue` — Show the full queue",
           "`/p` — Currently playing song",
@@ -1114,6 +1177,16 @@ function fmtTime(sec) {
   return `${m}:${String(s).padStart(2, "0")}`;
 }
 function playbackSeconds(state) {
+  // Prefer the player's own count of rendered audio: it advances exactly 20ms
+  // per opus frame actually played, so it never drifts. Wall-clock
+  // (Date.now() - startedAt) keeps running during network stalls/rebuffers
+  // while the audio is frozen, which slides the karaoke highlight out of sync.
+  const res = state.currentResource || state.player?.state?.resource;
+  const playedMs = Number(res?.playbackDuration);
+  if (res && Number.isFinite(playedMs) && playedMs >= 0) {
+    return (state.posBase || 0) + playedMs / 1000;
+  }
+  // Fallback before a resource exists (e.g. still buffering): wall-clock.
   const isPaused = state.player?.state?.status === AudioPlayerStatus.Paused && state.pausedAt;
   const referenceTime = isPaused ? state.pausedAt : Date.now();
   const elapsed = state.startedAt ? (referenceTime - state.startedAt) / 1000 : 0;
@@ -1136,6 +1209,104 @@ function progressLine(state) {
 }
 // Lyrics via LRCLIB (free, no key). Cached per title. Returns plain text plus
 // timestamped `synced` lines for karaoke scrolling, or null when missing.
+//
+// YouTube subtitle fetch: grab auto-generated captions from the video itself.
+// These are perfectly synced to the video timing (unlike LRCLIB which uses album timing).
+const ytSubCache = new Map();
+async function fetchYouTubeLyrics(videoUrl) {
+  if (!videoUrl) return null;
+  // Plain-text request (played by song name)? Resolve the same top video the
+  // playback pipe would pick, so subtitles belong to the song actually playing.
+  if (!isUrl(videoUrl)) {
+    const resolved = await resolveFirstVideoUrl(videoUrl).catch(() => null);
+    if (!resolved) return null;
+    videoUrl = resolved;
+  }
+  const id = extractYouTubeIdSafe(videoUrl);
+  if (!id) return null;
+  if (ytSubCache.has(id)) return ytSubCache.get(id);
+  const p = (async () => {
+    try {
+      const tmpFile = path.join(os.tmpdir(), `ytsub_${id}`);
+      // Prefer English, then Japanese (many songs are JP), then any original-language track.
+      await new Promise((resolve, reject) => {
+        const args = [
+          "--write-auto-sub", "--write-sub", "--sub-langs", "en.*,ja.*,original",
+          "--skip-download", "--no-warnings",
+          "-o", tmpFile, "--", videoUrl
+        ];
+        const proc = spawn(YTDLP_BIN, args, { stdio: ["ignore", "pipe", "pipe"] });
+        let stderr = "";
+        proc.stderr.on("data", d => stderr += d.toString());
+        proc.on("close", code => code === 0 ? resolve() : reject(new Error(stderr.slice(0, 200))));
+        setTimeout(() => { try { proc.kill(); } catch { } reject(new Error("timeout")); }, 60000);
+      });
+      // yt-dlp names the file <tmp>.<lang>.vtt — pick by preference, then clean up all.
+      const dir = path.dirname(tmpFile);
+      const base = path.basename(tmpFile);
+      const candidates = fs.readdirSync(dir).filter((f) => f.startsWith(base) && f.endsWith(".vtt"));
+      if (!candidates.length) return null;
+      const rank = (f) => (/\.en[.-]/.test(f) ? 0 : /\.ja[.-]/.test(f) ? 1 : 2);
+      candidates.sort((a, b) => rank(a) - rank(b));
+      const vttPath = path.join(dir, candidates[0]);
+      const vtt = fs.readFileSync(vttPath, "utf8");
+      for (const f of candidates) { try { fs.unlinkSync(path.join(dir, f)); } catch { } }
+      const synced = parseVttLyrics(vtt);
+      if (synced.length < 3) return null;
+      const plainText = synced.map(s => s.text).join("\n");
+      return { text: plainText, synced, artist: null, name: null, fromYouTube: true };
+    } catch { return null; }
+  })();
+  ytSubCache.set(id, p);
+  if (ytSubCache.size > 100) { try { ytSubCache.delete(ytSubCache.keys().next().value); } catch { } }
+  return p;
+}
+// Parse a WebVTT caption file into synced lyric lines. Handles CRLF, missing
+// hour component, inline tags, ♪ markers and sound effects.
+function parseVttLyrics(vtt) {
+  const synced = [];
+  const seen = new Set();
+  const normalized = String(vtt).replace(/\r\n?/g, "\n");
+  for (const block of normalized.split(/\n{2,}/)) {
+    const m = block.match(/(?:(\d{1,2}):)?(\d{1,2}):(\d{2}(?:[.,]\d+)?)\s*-->/);
+    if (!m) continue;
+    const t = (Number(m[1] || 0) * 3600) + (Number(m[2]) * 60) + Number(String(m[3]).replace(",", "."));
+    const lines = block.split("\n")
+      .filter((l) => !l.includes("-->") && !/^\d+$/.test(l.trim()) && !/^WEBVTT/.test(l) && !/^Kind:/.test(l) && !/^Language:/.test(l) && !/^NOTE/.test(l) && !/^STYLE/.test(l))
+      .map((l) => l.replace(/<[^>]+>/g, "").trim())
+      .filter(Boolean);
+    let text = lines.join(" ").trim();
+    if (/^\([^)]*\)$/.test(text) || /^\[[^\]]*\]$/.test(text)) continue;
+    text = text.replace(/♪\s*/g, "").replace(/\s*♪/g, "").trim();
+    if (!text || text.length < 2) continue;
+    const key = text.toLowerCase();
+    if (seen.has(key)) continue;
+    seen.clear();
+    seen.add(key);
+    synced.push({ t, text: text.slice(0, 160) });
+  }
+  synced.sort((a, b) => a.t - b.t);
+  return synced;
+}
+// One yt-dlp metadata pass for link plays: real title, exact duration and the
+// resolved video URL. The URL then feeds the (proven) subtitle downloader, and
+// the duration lets LRCLIB pick the right version — so lyrics match the song
+// and its timing without any manual offset.
+async function resolveVideoMeta(url) {
+  const out = { title: null, durationSec: null, videoUrl: null };
+  try {
+    const info = await ytdlp(url, ytdlpOpts({ dumpSingleJson: true, skipDownload: true, noWarnings: true }));
+    const e = info?.entries?.[0] || info;
+    if (e) {
+      out.title = e.title || null;
+      out.durationSec = numOrNull(e.duration);
+      out.videoUrl = e.webpage_url || (isUrl(url) ? url : null);
+    }
+  } catch (e) {
+    logPretty("WARN", `video meta resolve failed: ${e?.message || e}`);
+  }
+  return out;
+}
 const lyricCache = new Map();
 function parseSyncedLyrics(synced) {
   const out = [];
@@ -1159,9 +1330,10 @@ function lyricIndexAt(synced, elapsedSec) {
   }
   return idx;
 }
-async function fetchLyrics(title) {
+async function fetchLyrics(title, durationSec = null) {
   const key = String(title || "").slice(0, 80).toLowerCase().trim();
   if (!key || key.length < 3) return null;
+  if (isUrl(title)) return null; // never search LRCLIB with a raw link
   if (lyricCache.has(key)) return lyricCache.get(key);
   const p = (async () => {
     try {
@@ -1200,19 +1372,24 @@ async function fetchLyrics(title) {
         return common / Math.max(wa.length, wb.length);
       }
 
-      // Score and sort results: prefer synced lyrics with high similarity
+      // Score and sort results: prefer synced lyrics, high similarity, and a
+      // duration close to the played video (rejects wrong versions/covers).
+      const wantDur = Number.isFinite(Number(durationSec)) && Number(durationSec) > 0 ? Number(durationSec) : null;
       const scored = arr
         .filter((x) => x && (x.syncedLyrics || x.plainLyrics))
-        .map((x) => ({
-          entry: x,
-          sim: Math.max(similarity(x.trackName, queryLower), similarity(x.artistName + " " + x.trackName, queryLower)),
-          hasSynced: !!x.syncedLyrics,
-        }))
-        .sort((a, b) => {
-          // Prefer high similarity, then synced lyrics
-          if (Math.abs(a.sim - b.sim) > 0.15) return b.sim - a.sim;
-          return (b.hasSynced ? 1 : 0) - (a.hasSynced ? 1 : 0);
-        });
+        .map((x) => {
+          const sim = Math.max(similarity(x.trackName, queryLower), similarity(x.artistName + " " + x.trackName, queryLower));
+          const d = Number(x.duration);
+          const durDiff = wantDur && Number.isFinite(d) && d > 0 ? Math.abs(d - wantDur) : null;
+          let score = sim + (x.syncedLyrics ? 0.1 : 0);
+          if (durDiff !== null) {
+            if (durDiff <= 8) score += 0.35;          // same version
+            else if (durDiff <= 30) score += 0.1;      // close (maybe different master)
+            else score -= 0.5;                          // wrong version (live/cover/edit)
+          }
+          return { entry: x, sim, score, hasSynced: !!x.syncedLyrics };
+        })
+        .sort((a, b) => b.score - a.score || (b.hasSynced ? 1 : 0) - (a.hasSynced ? 1 : 0));
 
       // Reject if the best match is too dissimilar (likely wrong song)
       const best = scored[0];
@@ -1230,14 +1407,14 @@ async function fetchLyrics(title) {
     } catch { return null; }
   })();
   lyricCache.set(key, p);
-  if (lyricCache.size > 200) { try { lyricCache.delete(lyricCache.keys().next().value); } catch {} }
+  if (lyricCache.size > 200) { try { lyricCache.delete(lyricCache.keys().next().value); } catch { } }
   return p;
 }
 // Spotify-style karaoke block: a scrolling window of lines around the current
 // position — sung lines dimmed, the live line highlighted, upcoming lines plain.
 // Driven by track position so the window auto-scrolls as the song plays.
 function karaokeField(state, lyrics, estimated = false) {
-  const el = playbackSeconds(state);
+  const el = playbackSeconds(state) - (state.lyricOffset || 0);
   const synced = lyrics.synced;
   const idx = lyricIndexAt(synced, el);
   const PAST = 2, FUTURE = 4;
@@ -1246,17 +1423,25 @@ function karaokeField(state, lyrics, estimated = false) {
     rows.push("*♪ Intro — get ready…*");
     for (let i = 0; i < Math.min(FUTURE + 1, synced.length); i++) rows.push(`　${synced[i].text}`);
   } else {
+    const isInstrumental = (idx < synced.length - 1) && (el > synced[idx].t + 4) && (synced[idx + 1].t > el + 4);
     const start = Math.max(0, idx - PAST);
-    for (let i = start; i < idx; i++) rows.push(`╰╴${synced[i].text}`);
-    rows.push(`**🎤▶ ${synced[idx].text}**`);
+    for (let i = start; i <= idx; i++) {
+      if (i === idx && !isInstrumental) break;
+      rows.push(`╰─ ${synced[i].text}`);
+    }
+    if (isInstrumental) {
+      rows.push(`**🎶▶ *♪ Instrumental…***`);
+    } else {
+      rows.push(`**🎶▶ ${synced[idx].text}**`);
+    }
     for (let i = idx + 1; i < synced.length && rows.length < PAST + 1 + FUTURE; i++) rows.push(`　${synced[i].text}`);
-    if (idx >= synced.length - 1) rows.push("*♪ Outro…*");
+    if (idx >= synced.length - 1 && !isInstrumental) rows.push("*♪ Outro…*");
   }
   let value = rows.join("\n");
   if (value.length > 1000) value = value.slice(0, 997).trimEnd() + "…";
   const by = lyrics.artist ? ` · ${lyrics.artist}` : "";
   const est = estimated ? " · ~timing estimated" : "";
-  return { name: `🎤 Karaoke — sing along${by}${est}`, value: `​\n${value}\n​`, inline: false };
+  return { name: `🎶🎤Karaoke — sing along${by}${est}`, value: `​\n${value}\n​`, inline: false };
 }
 // No synced LRC available? Spread the plain lines evenly over the track so the
 // karaoke highlight still scrolls (clearly labelled as estimated).
@@ -1349,10 +1534,16 @@ async function resolveBotTextChannel(guild, fallbackId) {
         name: "bocchi",
         type: ChannelType.GuildText,
         topic: "Bocchi music room — live karaoke lyrics, music panel and bot messages.",
-        permissionOverwrites: [{
-          id: guild.roles.everyone.id,
-          allow: [PermissionFlagsBits.ViewChannel, PermissionFlagsBits.SendMessages, PermissionFlagsBits.ReadMessageHistory],
-        }],
+        permissionOverwrites: [
+          {
+            id: guild.roles.everyone.id,
+            allow: [PermissionFlagsBits.ViewChannel, PermissionFlagsBits.SendMessages, PermissionFlagsBits.ReadMessageHistory],
+          },
+          {
+            id: guild.client.user.id,
+            allow: [PermissionFlagsBits.ViewChannel, PermissionFlagsBits.SendMessages, PermissionFlagsBits.ReadMessageHistory, PermissionFlagsBits.ManageMessages, PermissionFlagsBits.EmbedLinks],
+          }
+        ],
         reason: "Create the bocchi text room",
       });
       try { setSavedControlChannel(guild.id, created.id); } catch { }
@@ -1436,7 +1627,7 @@ async function handlePrivateAiMessage(msg, session) {
     const message = error?.name === "AbortError"
       ? "Gemini took too long to respond. Please try again."
       : (error?.message || "Gemini request failed.");
-    await msg.reply({ content: message, allowedMentions: { parse: [] } }).catch(() => {});
+    await msg.reply({ content: message, allowedMentions: { parse: [] } }).catch(() => { });
   } finally {
     aiChatBusy.delete(sessionKey);
   }
@@ -1460,7 +1651,7 @@ async function handleAiChatMessage(msg) {
     const message = error?.name === "AbortError"
       ? "Gemini took too long to respond. Please try again."
       : (error?.message || "Gemini request failed.");
-    await msg.reply({ content: message, allowedMentions: { parse: [] } }).catch(() => {});
+    await msg.reply({ content: message, allowedMentions: { parse: [] } }).catch(() => { });
   } finally {
     aiChatBusy.delete(sessionKey);
   }
@@ -1471,7 +1662,7 @@ async function handleAiChatMessage(msg) {
 // commands run against the shared server; dangerous/admin commands are
 // filtered out; plain text gets a conversational reply.
 const DM_BLOCKED_COMMANDS = new Set(["ytsignin", "ytsignout", "botupdate", "setup", "setai", "setaip", "delete", "deletep", "clear", "airef", "vstate", "watchtogether", "video"]);
-const DM_MUSIC_COMMANDS = new Set(["play", "playlist", "skip", "stop", "pause", "resume", "queue", "np", "remove", "shuffle", "loop", "volume", "panel"]);
+const DM_MUSIC_COMMANDS = new Set(["play", "playlist", "skip", "stop", "pause", "resume", "queue", "np", "remove", "shuffle", "loop", "volume", "panel", "live"]);
 const DM_COMMAND_ALIASES = { p: "play", q: "queue", now: "np", next: "skip", s: "skip", st: "stop", vol: "volume", upd: "botupdate", h: "help", controls: "panel" };
 async function dmTargetGuild(userId) {
   let mutual = null;
@@ -1500,7 +1691,7 @@ async function runDmMusicCommand(msg, guild, cmd, parts) {
   }
   if (cmd === "np") {
     if (!state.current) return reply({ embeds: [infoEmbed("🎵 Nothing playing", `Use \`/play\` to start`)] });
-    const lyrNp = await fetchLyrics(state.current.title).catch(() => null);
+    const lyrNp = state.currentLyrics || (state.current.isFile || state.current.isLive ? null : await fetchLyrics(state.current.title).catch(() => null));
     return reply({ embeds: [buildNowPlayingEmbed(state, lyrNp)] });
   }
   if (cmd === "queue") {
@@ -1531,6 +1722,7 @@ async function runDmMusicCommand(msg, guild, cmd, parts) {
     if (meta.title && meta.title !== q) item.title = meta.title;
     if (meta.thumb) item.thumb = meta.thumb;
     if (meta.durationSec) item.durationSec = meta.durationSec;
+    if (meta.videoUrl) item.videoUrl = meta.videoUrl;
     const addedEmbed = makeEmbed(COLORS.success).setDescription(`### ➕ Added to queue`)
       .addFields(
         { name: "🎵 Track", value: `**${cleanTitle(item.title)}**`, inline: false },
@@ -1566,6 +1758,30 @@ async function runDmMusicCommand(msg, guild, cmd, parts) {
     if (!state.current) playNext(guild, textChannelId, state);
     return;
   }
+  if (cmd === "live") {
+    const raw = parts.join(" ").trim();
+    if (!raw) return reply({ embeds: [errorEmbed("Give me a live stream URL or search query\n**Example:** `live https://www.youtube.com/watch?v=...`")] });
+    const cleanUrl = sanitizeSearchQuery(raw);
+    const item = {
+      title: cleanUrl,
+      source: cleanUrl,
+      isLive: true,
+      durationSec: null,
+      requestedBy: msg.author.tag,
+      guild,
+      voiceChannelId: userVC,
+      textChannelId,
+    };
+    state.queue.push(item);
+    const shouldStart = !state.current;
+    if (shouldStart) playNext(guild, textChannelId, state);
+    resolveTitleAndThumb(cleanUrl).then(meta => {
+      if (meta.title && meta.title !== cleanUrl) item.title = meta.title;
+      if (meta.thumb) item.thumb = meta.thumb;
+      item.durationSec = null;
+    }).catch(() => { });
+    return reply({ embeds: [successEmbed("🔴 Live Stream Queued", `**${cleanUrl}**`)] });
+  }
   if (cmd === "skip") {
     if (!state.current) return reply({ embeds: [infoEmbed(" Nothing playing", "Nothing to skip")] });
     state.skipRequested = true;
@@ -1574,6 +1790,8 @@ async function runDmMusicCommand(msg, guild, cmd, parts) {
     return reply({ embeds: [successEmbed("⏭️ Skipped", state.queue.length ? `Next: **${state.queue[0]?.title || "—"}**` : "Queue is empty")] });
   }
   if (cmd === "stop") {
+    if (state.current) deleteIfUploaded(state.current);
+    state.queue.forEach(deleteIfUploaded);
     state.queue = [];
     state.current = null;
     state.startedAt = null;
@@ -1611,6 +1829,7 @@ async function runDmMusicCommand(msg, guild, cmd, parts) {
     if (Number.isNaN(index) || index < 1) return reply({ embeds: [errorEmbed(`Please give the queue number to remove\n**Example:** \`/remove index:3\``)] });
     if (index > state.queue.length) return reply({ embeds: [errorEmbed(`Number is past the queue end (${state.queue.length} tracks)`)] });
     const [rm] = state.queue.splice(index - 1, 1);
+    deleteIfUploaded(rm);
     return reply({ embeds: [successEmbed("🗑️  Removed from queue", `**${rm?.title || "Unknown"}**`)] });
   }
   return reply({ embeds: [errorEmbed(`\`${cmd}\` is not available in private chat`)] });
@@ -1638,6 +1857,12 @@ async function handleDmMessage(msg) {
     if (DM_MUSIC_COMMANDS.has(cmd)) {
       const guild = await dmTargetGuild(msg.author.id);
       if (!guild) return msg.reply({ embeds: [errorEmbed("I don't share any server with you yet — invite me and run `/setup` there first.")] });
+      const member = guild.members.cache.get(msg.author.id) || await guild.members.fetch(msg.author.id).catch(() => null);
+      const userVc = member?.voice?.channelId;
+      const botVc = guild.members.me?.voice?.channelId;
+      if (!userVc || (botVc && userVc !== botVc)) {
+        return msg.reply({ embeds: [errorEmbed(`You must be in the bot's voice room in **${guild.name}** to control playback.`)] });
+      }
       return runDmMusicCommand(msg, guild, cmd, parts);
     }
     if (looksLikeCommand) {
@@ -1702,17 +1927,23 @@ client.on("messageCreate", async (msg) => {
 const commands = [
   new SlashCommandBuilder().setName("play").setDescription("Play music from YouTube (song name or URL)")
     .addStringOption(o => o.setName("query").setDescription("Song name/URL").setRequired(true)),
+  new SlashCommandBuilder().setName("stm").setDescription("Stream audio from an uploaded file or local file in Assets")
+    .addAttachmentOption(o => o.setName("file").setDescription("Upload an audio file (mp3, wav, flac, ogg, m4a, webm)"))
+    .addStringOption(o => o.setName("name").setDescription("Audio file name in Assets folder").setAutocomplete(true)),
+  new SlashCommandBuilder().setName("lyricoffset").setDescription("Shift lyrics timing forwards or backwards (e.g. for music videos with long intros)")
+    .addNumberOption(o => o.setName("seconds").setDescription("Seconds to shift (e.g. 15 or -5)").setRequired(true)),
   new SlashCommandBuilder().setName("skip").setDescription("Skip the current song"),
   new SlashCommandBuilder().setName("stop").setDescription("Stop and clear the queue"),
   new SlashCommandBuilder().setName("pause").setDescription("Pause"),
   new SlashCommandBuilder().setName("resume").setDescription("Resume"),
   new SlashCommandBuilder().setName("ping").setDescription("Check ping"),
-  new SlashCommandBuilder().setName("botupdate").setDescription("Update yt-dlp"),
+  new SlashCommandBuilder().setName("botupdate").setDescription("Update yt-dlp (admin)")
+    .setDefaultMemberPermissions(PermissionFlagsBits.ManageGuild),
   new SlashCommandBuilder().setName("p").setDescription("What's playing right now"),
   new SlashCommandBuilder().setName("queue").setDescription("Show the remaining queue"),
   new SlashCommandBuilder().setName("list").setDescription("Show the remaining queue"),
-  new SlashCommandBuilder().setName("volume").setDescription("Adjust volume (0-10000)")
-    .addIntegerOption(o => o.setName("value").setDescription("Percent (0-10000)").setRequired(true).setMinValue(0).setMaxValue(10000)),
+  new SlashCommandBuilder().setName("volume").setDescription("Adjust volume (0-200)")
+    .addIntegerOption(o => o.setName("value").setDescription("Percent (0-200)").setRequired(true).setMinValue(0).setMaxValue(200)),
   new SlashCommandBuilder().setName("playlist").setDescription("Add songs in bulk from YouTube (playlist or search)")
     .addStringOption(o => o.setName("query").setDescription("Playlist link or search text").setRequired(true))
     .addIntegerOption(o => o.setName("limit").setDescription("Max count (omit = whole playlist) (1-5000)").setMinValue(1).setMaxValue(5000)),
@@ -1743,19 +1974,23 @@ const commands = [
   new SlashCommandBuilder().setName("deletep").setDescription("Delete all messages in the public AI chat")
     .setDefaultMemberPermissions(PermissionFlagsBits.ManageMessages)
     .addBooleanOption(o => o.setName("confirm").setDescription("Confirm deleting every message in the public AI chat").setRequired(true)),
-  new SlashCommandBuilder().setName("clear").setDescription("Clear this server's AI history and private chats")
+  new SlashCommandBuilder().setName("clear").setDescription("Clear this server's AI history, private chats, and music room")
     .setDefaultMemberPermissions(PermissionFlagsBits.ManageChannels),
   new SlashCommandBuilder().setName("panel").setDescription("Open the music control panel (buttons)"),
   new SlashCommandBuilder().setName("setup").setDescription("Create or reuse the music control room")
     .setDefaultMemberPermissions(PermissionFlagsBits.ManageGuild),
   new SlashCommandBuilder().setName("ytstatus").setDescription("Check YouTube sign-in status"),
   new SlashCommandBuilder().setName("ytsignin").setDescription("Sign in YouTube with cookies.txt (admin)")
+    .setDefaultMemberPermissions(PermissionFlagsBits.ManageGuild)
     .addAttachmentOption(o => o.setName("file").setDescription("cookies.txt file").setRequired(true)),
-  new SlashCommandBuilder().setName("ytsignout").setDescription("Remove YouTube cookies (admin)"),
+  new SlashCommandBuilder().setName("ytsignout").setDescription("Remove YouTube cookies (admin)")
+    .setDefaultMemberPermissions(PermissionFlagsBits.ManageGuild),
   new SlashCommandBuilder().setName("video").setDescription("Share the video page + play audio in voice (YouTube)")
     .addStringOption(o => o.setName("query").setDescription("Video name/YouTube URL").setRequired(true)),
   new SlashCommandBuilder().setName("watchtogether").setDescription("Watch video together in voice chat (Watch Together)"),
-  new SlashCommandBuilder().setName("vstate").setDescription("Debug: voice/player status (admin)"),
+  new SlashCommandBuilder().setName("vstate").setDescription("Debug: voice/player status (admin)")
+    .setDefaultMemberPermissions(PermissionFlagsBits.ManageGuild),
+  new SlashCommandBuilder().setName("batchplay").setDescription("Add multiple songs at once (opens a form to paste links)"),
 ].map(c => c.toJSON());
 
 // Guild queue and player state
@@ -1775,7 +2010,7 @@ function loadGuildSettings() {
 // An empty/garbage file makes yt-dlp fail EVERYTHING — worse than no cookies.
 let _cookieCache = { path: null, mtimeMs: 0, valid: false };
 function effectiveCookieFile() {
-  const p = config.cookieFile;
+  const p = ytCookiesPath();
   if (!p) return null;
   try {
     const st = fs.statSync(p);
@@ -1852,6 +2087,51 @@ function setSavedControlChannel(guildId, channelId) {
   all[String(guildId)] = { ...(all[String(guildId)] || {}), controlChannelId: channelId };
   saveGuildSettings(all);
 }
+async function deleteControlRoomMessages(guild) {
+  const channel = await resolveBotTextChannel(guild, null);
+  if (!channel) throw new Error("The control channel could not be resolved.");
+  if (!channel?.messages?.fetch || !channel?.bulkDelete) throw new Error("The configured control channel was not found.");
+
+  const state = getGuildState(guild);
+  const wasTickerRunning = !!state.ticker;
+  stopNowPlayingTicker(state);
+
+  let deleted = 0;
+  const fourteenDaysMs = 14 * 24 * 60 * 60 * 1000;
+  while (true) {
+    const batch = await channel.messages.fetch({ limit: 100 });
+    if (!batch.size) break;
+    const recent = batch.filter((message) => Date.now() - message.createdTimestamp < fourteenDaysMs);
+    const old = batch.filter((message) => Date.now() - message.createdTimestamp >= fourteenDaysMs);
+    let removedThisBatch = 0;
+
+    if (recent.size > 1) {
+      try {
+        removedThisBatch += (await channel.bulkDelete(recent, true)).size;
+      } catch {
+        for (const message of recent.values()) {
+          try { await message.delete(); removedThisBatch++; } catch { }
+        }
+      }
+    } else if (recent.size === 1) {
+      try { await recent.first().delete(); removedThisBatch++; } catch { }
+    }
+    for (const message of old.values()) {
+      try { await message.delete(); removedThisBatch++; } catch { }
+    }
+
+    if (!removedThisBatch) throw new Error("No messages could be deleted. Check the bot's Manage Messages permission.");
+    deleted += removedThisBatch;
+  }
+
+  state.npMessage = null;
+  const panel = state.current ? buildNowPlayingEmbed(state, state.currentLyrics) : buildPanelEmbed(guild);
+  await upsertNpMessage(guild, channel.id, panel, true);
+  if (wasTickerRunning && state.current) startNowPlayingTicker(guild, state);
+
+  return deleted;
+}
+
 async function deletePublicAiChat(guild) {
   const channelId = getSavedAiChannel(guild.id);
   if (!channelId) throw new Error("No public AI chat is configured. Run /setai first.");
@@ -1940,6 +2220,8 @@ function createGuildState(guild) {
     } else if (oldS.status === AudioPlayerStatus.Paused && newS.status === AudioPlayerStatus.Playing) {
       if (state.startedAt && state.pausedAt) state.startedAt += Date.now() - state.pausedAt;
       state.pausedAt = null;
+    } else if (oldS.status === AudioPlayerStatus.Buffering && newS.status === AudioPlayerStatus.Playing) {
+      state.startedAt = Date.now();
     }
     if (state.current && state.npMessage && [AudioPlayerStatus.Playing, AudioPlayerStatus.Paused].includes(newS.status)) {
       const channelId = getSavedControlChannel(guild.id) || state.current.textChannelId;
@@ -2041,7 +2323,27 @@ function cleanupCurrentPipeline(state) {
     state.currentPipe = null;
   }
 }
-function isUrl(s) { try { new URL(s); return true; } catch { return false; } }
+function isUrl(s) {
+  if (typeof s !== "string" || !s.trim()) return false;
+  try {
+    const u = new URL(s);
+    if (u.protocol !== "http:" && u.protocol !== "https:") return false;
+    const h = u.hostname.toLowerCase();
+    // Block loopback, link-local, cloud metadata service (169.254.169.254), and private IPs
+    if (h === "localhost" || h === "127.0.0.1" || h === "::1" || h === "0.0.0.0" || h === "169.254.169.254") return false;
+    if (/^(10\.|172\.(1[6-9]|2[0-9]|3[0-1])\.|192\.168\.)/.test(h)) return false;
+    return true;
+  } catch {
+    return false;
+  }
+}
+function sanitizeSearchQuery(q) {
+  let s = String(q || "").trim();
+  while (s.startsWith("-")) {
+    s = s.replace(/^-+/, "").trim();
+  }
+  return s.replace(/[\r\n]/g, " ");
+}
 
 // yt-dlp helper functions
 async function getTitle(input) {
@@ -2081,11 +2383,13 @@ async function resolveTitleAndThumb(input) {
       const meta = await spotifyMeta(input);
       if (meta.title && meta.title !== input) return { ...meta, durationSec: null };
     }
-    const info = await ytdlp(input, ytdlpOpts({ dumpSingleJson: true, skipDownload: true, noWarnings: true }));
+    const target = isUrl(input) ? input : `ytsearch1:${sanitizeSearchQuery(input)}`;
+    const info = await ytdlp(target, ytdlpOpts({ dumpSingleJson: true, skipDownload: true, noWarnings: true }));
     const e = info?.entries?.[0] || info;
     if (e?.title) {
       const url = e.webpage_url || input;
-      return { title: e.title, thumb: pickThumb(e, url) || thumbFor(input), durationSec: numOrNull(e.duration) };
+      const isLive = !!(e.is_live || e.live_status === "is_live");
+      return { title: e.title, thumb: pickThumb(e, url) || thumbFor(input), durationSec: isLive ? null : numOrNull(e.duration), videoUrl: e.webpage_url || null, isLive };
     }
   } catch { }
   return { title: input, thumb: thumbFor(input), durationSec: null };
@@ -2113,7 +2417,8 @@ async function resolveFirstVideoUrl(query) {
   }
   if (isUrl(query)) return query;
   try {
-    const out = await ytdlp(`ytsearch1:${query}`, ytdlpOpts({ dumpSingleJson: true }));
+    const cleanQuery = sanitizeSearchQuery(query);
+    const out = await ytdlp(`ytsearch1:${cleanQuery}`, ytdlpOpts({ dumpSingleJson: true }));
     return out?.entries?.[0]?.webpage_url || null;
   } catch (e) {
     logPretty("ERROR", "search resolve fail: " + (e?.message || e));
@@ -2141,14 +2446,14 @@ async function resolveVideoInfo(query) {
     if (!q2) return null;
     input = q2;
   }
-  if (!isUrl(input)) input = `ytsearch1:${input}`;
+  if (!isUrl(input)) input = `ytsearch1:${sanitizeSearchQuery(input)}`;
   try {
     const info = await ytdlp(input, ytdlpOpts({ dumpSingleJson: true, skipDownload: true, noWarnings: true }));
     const e = info?.entries?.[0] || info;
     if (!e) return null;
     const url = e.webpage_url || input;
     const title = e.title || query;
-    return { title, url, thumb: pickThumb(e, url), durationSec: numOrNull(e.duration), videoId: extractYouTubeId(e.webpage_url || url) || extractYouTubeId(query) };
+    return { title, url, thumb: pickThumb(e, url), durationSec: numOrNull(e.duration), isLive: !!e.is_live, videoId: extractYouTubeId(e.webpage_url || url) || extractYouTubeId(query) };
   } catch (e) {
     logPretty("ERROR", "video resolve fail: " + (e?.message || e));
     return null;
@@ -2310,7 +2615,7 @@ function spawnFfmpegFromDirectUrl(url, headersStr) {
 function altPlayerClient(primary) {
   return /android/i.test(primary || "") ? "web,web_creator" : "android";
 }
-function spawnUniversalPipe(source, playerClient, offsetSec) {
+function spawnUniversalPipe(source, playerClient, offsetSec, isLive = false) {
   if (!FFMPEG_AVAILABLE) throw new Error("ffmpeg binary not available");
 
   // ── yt-dlp ───────────────────────────────────────────────────────────────
@@ -2322,11 +2627,17 @@ function spawnUniversalPipe(source, playerClient, offsetSec) {
   ytArgs.push(
     "--no-check-certificates",
     "--retries", "infinite",
-    "--fragment-retries", "infinite",
+    "--fragment-retries", isLive ? "10" : "infinite",
     "--buffer-size", "64K",
     "--js-runtimes", "node",
   );
-  if (isTikTok) {
+  if (isLive) {
+    ytArgs.push(
+      "--extractor-args", `youtube:player-client=${playerClient || config.ytdlpPlayerClient};player_skip=webpage`,
+      "--no-live-from-start",
+      "-f", "bestaudio/best",
+    );
+  } else if (isTikTok) {
     // TikTok: needs impersonation to avoid 403
     // and must pick audio-only formats (some clips are video-only)
     ytArgs.push(
@@ -2343,7 +2654,7 @@ function spawnUniversalPipe(source, playerClient, offsetSec) {
       "--concurrent-fragments", "4",
     );
   }
-  ytArgs.push("-o", "-", source);
+  ytArgs.push("-o", "-", "--", source);
   const helper = spawn(YTDLP_BIN, ytArgs, { stdio: ["ignore", "pipe", "pipe"] });
   helper.on("error", (e) => logPretty("ERROR", "yt-dlp(universal) error: " + (e?.message || e)));
   helper.stdout.on("error", swallowPipeError);
@@ -2351,7 +2662,7 @@ function spawnUniversalPipe(source, playerClient, offsetSec) {
   helper.stderr.on("data", (d) => { try { logPretty("LOG", "[yt-dlp] " + d.toString().trim()); } catch { } });
 
   // ── ffmpeg ────────────────────────────────────────────────────────────────
-  const a = ffmpegStdinArgs(offsetSec);
+  const a = ffmpegStdinArgs(isLive ? 0 : offsetSec);
 
   const ff = spawn(FFMPEG || "ffmpeg", a, { stdio: ["pipe", "pipe", "pipe"] });
   ff.on("error", (e) => logPretty("ERROR", "ffmpeg(universal) error: " + (e?.message || e)));
@@ -2410,6 +2721,102 @@ function spawnFfmpegStdin(tag, offsetSec) {
   ff.stderr.on("data", (d) => { try { logPretty("LOG", `[ffmpeg(${tag})] ` + d.toString().trim()); } catch { } });
   return { ff, stream: cushionStream(ff), helper: null, raw: ff.stdout };
 }
+
+// ffmpeg with direct URL input (e.g. for M3U8 live streams).
+function ffmpegUrlArgs(url, offsetSec, isLive = false) {
+  const a = ["-loglevel", "info", "-hide_banner"];
+  if (isLive) {
+    a.push("-reconnect", "1", "-reconnect_streamed", "1", "-reconnect_delay_max", "5");
+  }
+  a.push("-user_agent", "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/126.0.0.0 Safari/537.36");
+  const off = Number(offsetSec);
+  if (Number.isFinite(off) && off > 0) a.push("-ss", String(off));
+  a.push("-i", url, "-vn");
+  a.push("-ac", String(config.audioChannels), "-ar", String(config.audioSampleRate));
+  const afChain = (config.audioFilter || "").trim();
+  if (afChain) a.push("-af", afChain);
+  a.push("-c:a", "libopus", "-b:a", config.opusBitrate);
+  if (config.opusVbr === "off") a.push("-vbr", "off");
+  else if (config.opusVbr === "constrained") a.push("-vbr", "constrained");
+  else a.push("-vbr", "on");
+  if (["audio", "voip", "lowdelay"].includes(config.opusApplication))
+    a.push("-application", config.opusApplication);
+  const fd = Number(config.opusFrameDuration);
+  if ([2.5, 5, 10, 20, 40, 60].includes(fd)) a.push("-frame_duration", String(fd));
+  const cx = Number(config.opusComplexity);
+  if (Number.isFinite(cx) && cx >= 0 && cx <= 10) a.push("-compression_level", String(cx));
+  if (config.ffmpegExtraArgs && config.ffmpegExtraArgs.trim())
+    a.push(...config.ffmpegExtraArgs.trim().split(/\s+/));
+  a.push("-f", "ogg", "pipe:1");
+  return a;
+}
+
+function spawnFfmpegUrlPipe(url, offsetSec, isLive = false) {
+  if (!FFMPEG_AVAILABLE) throw new Error("ffmpeg binary not available");
+  const ff = spawn(FFMPEG || "ffmpeg", ffmpegUrlArgs(url, offsetSec, isLive), { stdio: ["ignore", "pipe", "pipe"] });
+  ff.on("error", (e) => logPretty("ERROR", `ffmpeg(url) error: ` + (e?.message || e)));
+  ff.stdout.on("error", swallowPipeError);
+  ff.stderr.on("error", swallowPipeError);
+  ff.stderr.on("data", (d) => { try { logPretty("LOG", `[ffmpeg(url)] ` + d.toString().trim()); } catch { } });
+  return { ff, stream: cushionStream(ff), helper: null, raw: ff.stdout };
+}
+
+// ffmpeg with local audio file input. Directly reads file with native seek support.
+function ffmpegFileArgs(filePath, offsetSec) {
+  const a = ["-loglevel", "info", "-hide_banner"];
+  const off = Number(offsetSec);
+  if (Number.isFinite(off) && off > 0) a.push("-ss", String(off));
+  a.push("-i", filePath, "-vn");
+  a.push("-ac", String(config.audioChannels), "-ar", String(config.audioSampleRate));
+  const afChain = (config.audioFilter || "").trim();
+  if (afChain) a.push("-af", afChain);
+  a.push("-c:a", "libopus", "-b:a", config.opusBitrate);
+  if (config.opusVbr === "off") a.push("-vbr", "off");
+  else if (config.opusVbr === "constrained") a.push("-vbr", "constrained");
+  else a.push("-vbr", "on");
+  if (["audio", "voip", "lowdelay"].includes(config.opusApplication))
+    a.push("-application", config.opusApplication);
+  const fd = Number(config.opusFrameDuration);
+  if ([2.5, 5, 10, 20, 40, 60].includes(fd)) a.push("-frame_duration", String(fd));
+  const cx = Number(config.opusComplexity);
+  if (Number.isFinite(cx) && cx >= 0 && cx <= 10) a.push("-compression_level", String(cx));
+  if (config.ffmpegExtraArgs && config.ffmpegExtraArgs.trim())
+    a.push(...config.ffmpegExtraArgs.trim().split(/\s+/));
+  a.push("-f", "ogg", "pipe:1");
+  return a;
+}
+
+function spawnFfmpegFilePipe(filePath, offsetSec) {
+  if (!FFMPEG_AVAILABLE) throw new Error("ffmpeg binary not available");
+  const ff = spawn(FFMPEG || "ffmpeg", ffmpegFileArgs(filePath, offsetSec), { stdio: ["ignore", "pipe", "pipe"] });
+  ff.on("error", (e) => logPretty("ERROR", `ffmpeg(file) error: ` + (e?.message || e)));
+  ff.stdout.on("error", swallowPipeError);
+  ff.stderr.on("error", swallowPipeError);
+  ff.stderr.on("data", (d) => { try { logPretty("LOG", "[ffmpeg(file)] " + d.toString().trim()); } catch { } });
+  return { ff, stream: cushionStream(ff), helper: null, raw: ff.stdout };
+}
+
+// Quick metadata resolution for audio files via ffmpeg -i
+async function resolveAudioFileMeta(filePath) {
+  return new Promise((resolve) => {
+    try {
+      const ff = spawn(FFMPEG || "ffmpeg", ["-hide_banner", "-i", filePath]);
+      let errBuf = "";
+      ff.stderr.on("data", (d) => { errBuf += d.toString(); });
+      ff.on("close", () => {
+        let durationSec = null;
+        const match = errBuf.match(/Duration:\s*(\d+):(\d+):(\d+(?:\.\d+)?)/);
+        if (match) {
+          durationSec = Number(match[1]) * 3600 + Number(match[2]) * 60 + parseFloat(match[3]);
+        }
+        resolve({ durationSec: Number.isFinite(durationSec) && durationSec > 0 ? durationSec : null });
+      });
+      ff.on("error", () => resolve({ durationSec: null }));
+    } catch {
+      resolve({ durationSec: null });
+    }
+  });
+}
 // Wrap an ffmpeg process's stdout in a PassThrough cushion (up to 384KB ≈
 // 24s of 128k audio) so slow-starting sources don't stutter the beginning.
 // Data is preserved for playback; probe the LIVE raw output separately.
@@ -2428,7 +2835,7 @@ async function awaitPrebuffer(pipeObj, minBytes, maxWaitMs) {
   if ((s.readableLength || 0) >= minBytes) return;
   await new Promise((resolve) => {
     let done = false;
-    const cleanup = () => { clearTimeout(timer); s.off("readable", onReadable); s.off("close", onClose); s.off("error", onClose); };
+    const cleanup = () => { clearTimeout(timer); s.off("readable", onReadable); s.off("close", onClose); s.off("error", onClose); s.off("end", onClose); };
     const finish = () => { if (!done) { done = true; cleanup(); resolve(); } };
     const onReadable = () => { if ((s.readableLength || 0) >= minBytes) finish(); };
     const onClose = () => finish(); // dead source → let probe fail fast
@@ -2436,6 +2843,7 @@ async function awaitPrebuffer(pipeObj, minBytes, maxWaitMs) {
     s.on("readable", onReadable);
     s.on("close", onClose);
     s.on("error", onClose);
+    s.on("end", onClose);
   });
 }
 
@@ -2591,7 +2999,7 @@ async function fetchPlaylistEntries(input, limit = null) {
       }
     } else {
       const n = Number.isFinite(max) ? max : 25;
-      const out = await ytdlp(`ytsearch${n}:${input}`, ytdlpOpts({ dumpSingleJson: true }));
+      const out = await ytdlp(`ytsearch${n}:${sanitizeSearchQuery(input)}`, ytdlpOpts({ dumpSingleJson: true }));
       const arr = out?.entries || [];
       for (const e of arr) {
         if (entries.length >= n) break;
@@ -2628,6 +3036,16 @@ async function playEndChime(guild, state) {
     });
   } catch (e) { logPretty("WARN", `End jingle failed: ${e?.message || e}`); }
 }
+
+function deleteIfUploaded(item) {
+  if (item && item.isFile && item.filePath) {
+    const uploadsDir = path.join(config.dataDir, "uploads");
+    if (item.filePath.startsWith(uploadsDir)) {
+      try { fs.unlinkSync(item.filePath); } catch { }
+    }
+  }
+}
+
 async function handlePlayerIdle(guild, state) {
   stopNowPlayingTicker(state);
   cleanupCurrentPipeline(state);
@@ -2646,7 +3064,16 @@ async function handlePlayerIdle(guild, state) {
   if (!state.prevJump && finished && finished.source) {
     const h = state.history || (state.history = []);
     if (!h.length || h[h.length - 1].title !== finished.title) {
-      h.push({ title: finished.title, source: finished.source, thumb: finished.thumb || null, durationSec: finished.durationSec || null, requestedBy: finished.requestedBy });
+      h.push({
+        title: finished.title,
+        source: finished.source,
+        thumb: finished.thumb || null,
+        durationSec: finished.durationSec || null,
+        requestedBy: finished.requestedBy,
+        filePath: finished.filePath || null,
+        isFile: !!finished.isFile,
+        isLive: !!finished.isLive,
+      });
       if (h.length > 30) h.shift();
     }
   }
@@ -2661,11 +3088,13 @@ async function handlePlayerIdle(guild, state) {
     state.loopMode = "off";
     state.quickFails = 0;
     logPretty("ERROR", `Giving up loop on "${finished.title}" (died 3x in a row)`);
-    const loopWarnMsg = await sendToTextChannel(guild, finished.textChannelId, { embeds: [
-      makeEmbed(COLORS.warning)
-        .setDescription(`### ⛔  Stopped looping\n**${cleanTitle(finished.title)}** keeps failing — loop is off. Check \`/ytstatus\` or re-upload cookies with \`/ytsignin\`.`)
-    ]});
-    if (loopWarnMsg) setTimeout(() => loopWarnMsg.delete().catch(() => {}), 3 * 60 * 1000);
+    const loopWarnMsg = await sendToTextChannel(guild, finished.textChannelId, {
+      embeds: [
+        makeEmbed(COLORS.warning)
+          .setDescription(`### ⛔  Stopped looping\n**${cleanTitle(finished.title)}** keeps failing — loop is off. Check \`/ytstatus\` or re-upload cookies with \`/ytsignin\`.`)
+      ]
+    });
+    if (loopWarnMsg) setTimeout(() => loopWarnMsg.delete().catch(() => { }), 3 * 60 * 1000);
     state.current = null;
     await playNext(guild, finished.textChannelId, state);
     return;
@@ -2679,6 +3108,8 @@ async function handlePlayerIdle(guild, state) {
 
   if (state.loopMode === "queue") {
     state.queue.push({ ...finished });
+  } else {
+    deleteIfUploaded(finished);
   }
 
   state.current = null;
@@ -2704,7 +3135,7 @@ async function handlePlayerError(error, guild, state) {
           .setDescription("### 🔁 Signal lost\nReconnecting…")
       ]
     });
-    if (signalMsg) setTimeout(() => signalMsg.delete().catch(() => {}), 3 * 60 * 1000);
+    if (signalMsg) setTimeout(() => signalMsg.delete().catch(() => { }), 3 * 60 * 1000);
     await playSame(guild, tc, cur, state);
     return;
   }
@@ -2763,30 +3194,71 @@ async function playNext(guild, textChannelId, state = getGuildState(guild)) {
   state.pausedAt = null;
 
   try {
-    // Lyrics resolve in parallel with audio extraction — no added delay.
-    const lyrP = fetchLyrics(next.title).catch(() => null);
+    // LRCLIB fetch runs in parallel (uses album timing, fast).
+    let lyrP = (next.isFile || next.isLive) ? Promise.resolve(null) : fetchLyrics(next.title, next.durationSec).catch(() => null);
+    const oldTitle = next.title;
     // Use unified playback helper; this will throw on resolution errors.
-    // stayPut: automatic queue advances never move rooms. Fresh /play-style
-    // requests already validated same-room-or-no-connection, so staying is safe.
     const { pageUrl } = await startPlayback(guild, next, state, true);
     if (stale()) return; // a newer playback took over — don't touch state
-    state.startedAt = Date.now();
+
+    // Link plays start with title = the URL; wait briefly for the parallel
+    // metadata resolve (audio is already playing, so this delays nothing).
+    if (!next.isLive && !next.isFile && (isUrl(next.title) || next.title === oldTitle && isUrl(oldTitle))) {
+      for (let i = 0; i < 16 && (isUrl(next.title) || !next.durationSec); i++) {
+        await new Promise((r) => setTimeout(r, 500));
+        if (stale()) return;
+      }
+      // Metadata still missing? One direct probe gives title + duration + URL.
+      if (isUrl(next.title) || !next.durationSec) {
+        const probeTarget = isUrl(next.title) ? next.title : next.source;
+        if (isUrl(probeTarget)) {
+          const meta = await resolveVideoMeta(probeTarget);
+          if (stale()) return;
+          if (meta.title && isUrl(next.title)) next.title = meta.title;
+          if (!next.durationSec && meta.durationSec) next.durationSec = meta.durationSec;
+          if (!next.videoUrl && meta.videoUrl) next.videoUrl = meta.videoUrl;
+        }
+      }
+    }
+    // Refetch with the real title + duration so LRCLIB picks the right version.
+    if (!next.isFile && !next.isLive && (next.title !== oldTitle || next.durationSec)) {
+      lyrP = fetchLyrics(next.title, next.durationSec).catch(() => null);
+    }
+
+    // startedAt is set by the stateChange handler (buffering→playing)
     state.pausedAt = null;
     state.lastStart = { title: next.title, t: Date.now() };
     state.failStreak = 0;
     logPretty("NOWPLAY", `${next.title}`, {
-      user:  next.requestedBy,
+      user: next.requestedBy,
       tail: `up_next: ${state.queue[0]?.title || "—"}`,
     });
-    const lyrics = await lyrP;
+
+    // Use LRCLIB as immediate baseline
+    const lrcLib = await lyrP;
     if (stale()) return;
-    state.currentLyrics = lyrics;
+    state.currentLyrics = lrcLib;
     const controlChannelId = getSavedControlChannel(guild.id) || next.textChannelId;
-    await upsertNpMessage(guild, controlChannelId, buildNowPlayingEmbed(state, lyrics));
+    await upsertNpMessage(guild, controlChannelId, buildNowPlayingEmbed(state, lrcLib));
     startNowPlayingTicker(guild, state);
+
+    // YouTube subtitle fetch: perfectly synced to the video timing.
+    // This can take 30-40s if YouTube throttles yt-dlp, so we run it completely
+    // asynchronously in the background without blocking the song from starting!
+    if (!next.isFile && !next.isLive) {
+      fetchYouTubeLyrics(next.videoUrl || next.source).then(async (ytSub) => {
+        if (stale() || state.current !== next) return; // Song changed while downloading
+        if (ytSub && ytSub.synced?.length) {
+          logPretty("INFO", "YouTube subtitles arrived (video-synced), swapping lyrics");
+          state.currentLyrics = ytSub;
+          await refreshNpControls(guild, state);
+        }
+      }).catch(() => null);
+    }
+
   } catch (e) {
     if (stale()) { // put the song back — the newer flow owns the queue now
-      try { if (state.current !== next && next) state.queue.unshift(next); } catch {}
+      try { if (state.current !== next && next) state.queue.unshift(next); } catch { }
       return;
     }
     const reason = String(e?.message || e || "unknown").slice(0, 300);
@@ -2797,11 +3269,13 @@ async function playNext(guild, textChannelId, state = getGuildState(guild)) {
       state.current = null;
       state.queue.unshift(next);
       logPretty("WARN", `Retrying "${next.title}" with player-client=${next.altClient} (no cookies needed?)`);
-      const retryMsg = await sendToTextChannel(guild, next.textChannelId, { embeds: [
-        makeEmbed(COLORS.info)
-          .setDescription(`### 🔄  Trying another way\n**${cleanTitle(next.title)}** needs sign-in on this client — retrying without cookies…`)
-      ]});
-      if (retryMsg) setTimeout(() => retryMsg.delete().catch(() => {}), 5 * 60 * 1000);
+      const retryMsg = await sendToTextChannel(guild, next.textChannelId, {
+        embeds: [
+          makeEmbed(COLORS.info)
+            .setDescription(`### 🔄  Trying another way\n**${cleanTitle(next.title)}** needs sign-in on this client — retrying without cookies…`)
+        ]
+      });
+      if (retryMsg) setTimeout(() => retryMsg.delete().catch(() => { }), 5 * 60 * 1000);
       await playNext(guild, textChannelId, state);
       return;
     }
@@ -2814,11 +3288,13 @@ async function playNext(guild, textChannelId, state = getGuildState(guild)) {
     logPretty("ERROR", "play error: " + reason);
     if ((state.failStreak || 0) >= 3) {
       logPretty("ERROR", `Giving up on "${next?.title}" after 3 straight failures`);
-      const giveUpMsg = await sendToTextChannel(guild, next.textChannelId, { embeds: [
-        makeEmbed(COLORS.error)
-          .setDescription(`### ⛔  Giving up\n**${cleanTitle(next?.title)}** failed 3 times in a row — removed from rotation.`)
-      ]});
-      if (giveUpMsg) setTimeout(() => giveUpMsg.delete().catch(() => {}), 3 * 60 * 1000);
+      const giveUpMsg = await sendToTextChannel(guild, next.textChannelId, {
+        embeds: [
+          makeEmbed(COLORS.error)
+            .setDescription(`### ⛔  Giving up\n**${cleanTitle(next?.title)}** failed 3 times in a row — removed from rotation.`)
+        ]
+      });
+      if (giveUpMsg) setTimeout(() => giveUpMsg.delete().catch(() => { }), 3 * 60 * 1000);
       if (state.loopMode === "track") state.loopMode = "off";
       state.failStreak = 0;
       state.current = null;
@@ -2831,7 +3307,7 @@ async function playNext(guild, textChannelId, state = getGuildState(guild)) {
           .setDescription(`### ⚠️  Skipped this track (not a skip command)\n**${next?.title ?? "Unknown"}** failed: \`${reason}\`${hint}`)
       ]
     });
-    if (skipWarnMsg) setTimeout(() => skipWarnMsg.delete().catch(() => {}), 3 * 60 * 1000);
+    if (skipWarnMsg) setTimeout(() => skipWarnMsg.delete().catch(() => { }), 3 * 60 * 1000);
     state.current = null;
     await playNext(guild, textChannelId, state);
   }
@@ -2854,12 +3330,24 @@ async function playSame(guild, textChannelId, item, state = getGuildState(guild)
     state.pausedAt = null;
     state.lastStart = { title: item.title, t: Date.now() };
     logPretty("WARN", `RESTARTED  ${item.title}`);
-    const lyrRe = await fetchLyrics(item.title).catch(() => null);
+    // Keep YouTube-synced lyrics across loop/speed/seek restarts; only refetch when missing.
+    let lyrRe = (state.currentLyrics?.fromYouTube && Array.isArray(state.currentLyrics.synced) && state.currentLyrics.synced.length)
+      ? state.currentLyrics
+      : (item.isFile || item.isLive ? null : await fetchLyrics(item.title).catch(() => null));
     if (stale()) return;
     state.currentLyrics = lyrRe;
     const controlChannelId = getSavedControlChannel(guild.id) || textChannelId;
     await upsertNpMessage(guild, controlChannelId, buildNowPlayingEmbed(state, lyrRe));
     startNowPlayingTicker(guild, state);
+    if (!lyrRe?.fromYouTube && !item.isFile && !item.isLive) {
+      fetchYouTubeLyrics(item.videoUrl || item.source).then(async (ytSub) => {
+        if (stale() || state.current !== item) return;
+        if (ytSub && ytSub.synced?.length) {
+          state.currentLyrics = ytSub;
+          await refreshNpControls(guild, state);
+        }
+      }).catch(() => null);
+    }
   } catch (err) {
     const msg = String(err?.message || err || "");
     logPretty("ERROR", "playSame error: " + msg);
@@ -2888,6 +3376,16 @@ async function startPlayback(guild, item, state, stayPut = false) {
   // Ensure the bot is connected to the correct voice channel and subscribed to the player
   ensureVC(guild, item.voiceChannelId, state, { stay: stayPut });
 
+  // Stream directly from a local or uploaded audio file
+  if (item.isFile && item.filePath) {
+    if (!fs.existsSync(item.filePath)) {
+      throw new Error(`Audio file not found: ${path.basename(item.filePath)}`);
+    }
+    const pipeObj = spawnFfmpegFilePipe(item.filePath, consumeOffset(item, state));
+    await playPipe(guild, item, state, pipeObj);
+    return { pageUrl: null };
+  }
+
   // Resolve source: convert Spotify track → search query if needed.
   // For everything else (YouTube URL, search text, SoundCloud URL etc.)
   // we pass it straight to yt-dlp which handles search internally.
@@ -2897,10 +3395,20 @@ async function startPlayback(guild, item, state, stayPut = false) {
     if (kind === "album" || kind === "playlist") throw new Error("Spotify albums/playlists not supported in play; use /playlist");
     const q = await spotifyTrackToSearchQuery(source);
     if (!q) throw new Error("cannot resolve Spotify track title");
-    source = `ytsearch1:${q}`;
+    source = `ytsearch1:${sanitizeSearchQuery(q)}`;
   } else if (!isUrl(source)) {
     // Plain text search query — prefix with ytsearch so yt-dlp searches YouTube
-    source = `ytsearch1:${source}`;
+    source = `ytsearch1:${sanitizeSearchQuery(source)}`;
+  }
+
+  // Live stream handling
+  if (item.isLive) {
+    const pc = item.altClient || config.ytdlpPlayerClient;
+    const info = await ytdlp(source, ytdlpOpts({ dumpSingleJson: true, skipDownload: true, extractorArgs: `youtube:player-client=${pc};player_skip=webpage` }));
+    const e = info?.entries?.[0] || info;
+    if (!e || !e.url) throw new Error("Could not extract live stream URL");
+    await playPipe(guild, item, state, spawnFfmpegUrlPipe(e.url, 0, true));
+    return { pageUrl: source };
   }
 
   // TikTok: metadata via TikWM. Audio is streamed via Cloudflare Worker proxy
@@ -2910,22 +3418,41 @@ async function startPlayback(guild, item, state, stayPut = false) {
       const meta = await tiktokMeta(source);
       if (item.title === item.source) item.title = meta.title;
       if (!item.thumb && meta.thumb) item.thumb = meta.thumb;
-      
-      // Use the Cloudflare proxy to fetch the TikTok CDN URL
-      const cfProxyUrl = "https://bold-wood-cfdb.locallocal065.workers.dev/?url=" + encodeURIComponent(meta.audioUrl);
-      logPretty("LOG", `[tikwm] audio via CF proxy (fetch) <- ${meta.audioUrl.slice(0, 90)}...`);
-      
-      // Node.js fetch() easily bypasses Cloudflare's Bot Fight Mode which was blocking
-      // ffmpeg and yt-dlp on Railway datacenter IPs. We fetch the stream and pipe it.
-      const res = await fetch(cfProxyUrl, {
-        headers: { 'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/126.0 Safari/537.36' }
-      });
-      if (!res.ok) throw new Error(`CF proxy returned ${res.status}`);
-      
+
+      const UA = 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/126.0 Safari/537.36';
+      const cfProxy = (u) => "https://bold-wood-cfdb.locallocal065.workers.dev/?url=" + encodeURIComponent(u);
+
+      // Sound clip shorter than the video → it's a snippet; use the video's own audio.
+      const vidDur = Number(meta.duration) || 0;
+      const sndDur = Number(meta.musicDuration) || 0;
+      const soundTruncated = vidDur > 0 && (sndDur === 0 || sndDur + 1 < vidDur);
+      let res = null;
+      if (meta.videoUrl && soundTruncated) {
+        logPretty("LOG", `[tikwm] sound is ${sndDur || "?"}s but video is ${vidDur}s - using video audio`);
+        for (const u of [meta.videoUrl, cfProxy(meta.videoUrl)]) {
+          try {
+            const r = await fetch(u, { headers: { 'User-Agent': UA, 'Referer': 'https://www.tiktok.com/' } });
+            if (r.ok && r.body) { res = r; break; }
+            logPretty("WARN", `[tikwm] video fetch ${r.status} <- ${u.slice(0, 60)}...`);
+          } catch (err) { logPretty("WARN", `[tikwm] video fetch failed: ${err?.message || err}`); }
+        }
+      }
+
+      if (!res) {
+        // Use the Cloudflare proxy to fetch the TikTok CDN URL
+        const cfProxyUrl = cfProxy(meta.audioUrl);
+        logPretty("LOG", `[tikwm] audio via CF proxy (fetch) <- ${meta.audioUrl.slice(0, 90)}...`);
+
+        // Node.js fetch() easily bypasses Cloudflare's Bot Fight Mode which was blocking
+        // ffmpeg and yt-dlp on Railway datacenter IPs. We fetch the stream and pipe it.
+        res = await fetch(cfProxyUrl, { headers: { 'User-Agent': UA } });
+        if (!res.ok) throw new Error(`CF proxy returned ${res.status}`);
+      }
+
       const { Readable } = require("stream");
       const pipeObj = spawnFfmpegStdin("tiktok-cf", consumeOffset(item, state));
       Readable.fromWeb(res.body).pipe(pipeObj.ff.stdin);
-      
+
       await playPipe(guild, item, state, pipeObj);
       return { pageUrl: source };
     } catch (e) {
@@ -2988,7 +3515,7 @@ async function playPipe(guild, item, state, pipeObj) {
 
 function setVolumePct(state, pct) {
   if (pct < 0) pct = 0;
-  if (pct > 10000) pct = 10000;
+  if (pct > 200) pct = 200;
   state.volumePct = pct;
   applyVolume(state);
   // Remember per server across restarts
@@ -3018,6 +3545,18 @@ client.once(Events.ClientReady, async () => {
     const ONE_DAY = 24 * 3600 * 1000;
     if (Date.now() - readLastUpdateTs() > ONE_DAY) runYtDlpUpdate();
   }
+
+  // Broadcast "Server Started" to all #bocchi channels
+  for (const guild of client.guilds.cache.values()) {
+    const bocchiChannel = guild.channels.cache.find(c => c.type === ChannelType.GuildText && c.name.toLowerCase() === "bocchi");
+    if (bocchiChannel) {
+      const embed = makeEmbed(COLORS.success)
+        .setTitle("✅ Bot Started")
+        .setDescription("I am now online and ready to play music!")
+        .setTimestamp();
+      bocchiChannel.send({ embeds: [embed] }).catch(() => { });
+    }
+  }
 });
 
 client.on("interactionCreate", async (itx) => {
@@ -3034,6 +3573,25 @@ client.on("interactionCreate", async (itx) => {
       });
       const filtered = choices.filter(choice => choice.name.toLowerCase().includes(focusedValue)).slice(0, 25);
       await itx.respond(filtered);
+      return;
+    }
+    if (itx.commandName === "stm") {
+      try {
+        const focusedValue = (itx.options.getFocused() || "").toString().toLowerCase();
+        const assetsDir = path.resolve(__dirname, "Assets");
+        if (fs.existsSync(assetsDir)) {
+          const files = fs.readdirSync(assetsDir).filter(f => {
+            const ext = path.extname(f).toLowerCase();
+            return [".mp3", ".wav", ".ogg", ".flac", ".m4a", ".aac", ".opus", ".webm", ".wma"].includes(ext);
+          });
+          const choices = files
+            .filter(f => f.toLowerCase().includes(focusedValue))
+            .slice(0, 25)
+            .map(f => ({ name: f.length > 100 ? f.slice(0, 97) + "..." : f, value: f }));
+          return await itx.respond(choices);
+        }
+      } catch { }
+      return await itx.respond([]);
     }
     return;
   }
@@ -3043,6 +3601,61 @@ client.on("interactionCreate", async (itx) => {
       if (String(itx.customId || "").startsWith("mus_")) return await handleMusicButton(itx);
     } catch (e) { try { await itx.reply({ content: "Error: " + (e?.message || e), flags: MessageFlags.Ephemeral }); } catch { } return; }
     return;
+  }
+  // --- Batch Play modal submission handler ---
+  if (itx.isModalSubmit && itx.isModalSubmit() && itx.customId === "batch_play_modal") {
+    try {
+      await itx.deferReply({ flags: MessageFlags.Ephemeral });
+      const raw = itx.fields.getTextInputValue("batch_play_links");
+      const lines = raw.split(/\r?\n/).map(l => l.trim()).filter(l => l.length > 0).slice(0, 25);
+      if (!lines.length) return itx.editReply({ embeds: [errorEmbed("No links or song names provided")] });
+      const guild = itx.guild;
+      const state = getGuildState(guild);
+      const userVC = itx.member?.voice?.channelId;
+      if (!userVC) return itx.editReply({ embeds: [errorEmbed("Please join a voice channel first 🎙️")] });
+      const shouldStart = !state.current;
+      const metaPromises = [];
+      for (const line of lines) {
+        const item = {
+          title: line,
+          source: line,
+          requestedBy: itx.user.tag,
+          guild,
+          voiceChannelId: userVC,
+          textChannelId: itx.channelId,
+        };
+        state.queue.push(item);
+        // Resolve real titles in the background
+        metaPromises.push(
+          resolveTitleAndThumb(line).then(meta => {
+            if (meta.title && meta.title !== line) item.title = meta.title;
+            if (meta.thumb) item.thumb = meta.thumb;
+            if (meta.durationSec) item.durationSec = meta.durationSec;
+            if (meta.videoUrl) item.videoUrl = meta.videoUrl;
+          }).catch(() => { })
+        );
+      }
+      if (shouldStart) playNext(guild, itx.channelId, state);
+      // Wait for metadata in background, then reply
+      await Promise.allSettled(metaPromises);
+      const preview = lines.slice(0, 8).map((l, i) => {
+        const item = state.queue.find(q => q.source === l);
+        const title = item ? cleanTitle(item.title) : l;
+        return `\`${i + 1}.\` ${title.length > 60 ? title.slice(0, 57) + "..." : title}`;
+      }).join("\n");
+      const more = lines.length > 8 ? `\n*… and **${lines.length - 8}** more*` : "";
+      const batchEmbed = makeEmbed(COLORS.success)
+        .setDescription(`### 📥 Batch Play — ${lines.length} track${lines.length > 1 ? "s" : ""} added`)
+        .addFields(
+          { name: "🎶 Tracks", value: `${preview}${more}`, inline: false },
+          { name: "👤 Requested by", value: `${itx.user}`, inline: true },
+          { name: "📋 Queue size", value: `\`${state.queue.length}\``, inline: true },
+        );
+      return itx.editReply({ embeds: [batchEmbed] });
+    } catch (e) {
+      try { await itx.editReply({ content: "Batch play error: " + (e?.message || e) }); } catch { }
+      return;
+    }
   }
   if (!itx.isChatInputCommand()) return;
   // Calculate round-trip time. Clamp at zero to avoid negative values when clocks differ.
@@ -3086,6 +3699,9 @@ client.on("interactionCreate", async (itx) => {
     await itx.deferReply({ flags: MessageFlags.Ephemeral });
     try {
       const privateSession = await getPrivateAiSession(itx);
+      if (!privateSession && !isGuildAdmin(itx.member)) {
+        return itx.editReply({ content: "Manage Server permission required to change public AI persona." });
+      }
       const reset = itx.options.getBoolean("reset") === true;
       let persona = "";
       if (!reset) {
@@ -3099,18 +3715,29 @@ client.on("interactionCreate", async (itx) => {
       } else {
         setAiPersona(aiSessionKeyForChannel(itx.guildId, itx.channelId), persona);
       }
-      return itx.editReply({ content: reset
-        ? "Reset this chat to Gemini's default personality. Other chats are unchanged."
-        : `Applied this persona to the current chat only (${persona.length} characters). Other chats are unchanged.` });
+      return itx.editReply({
+        content: reset
+          ? "Reset this chat to Gemini's default personality. Other chats are unchanged."
+          : `Applied this persona to the current chat only (${persona.length} characters). Other chats are unchanged.`
+      });
     } catch (error) {
       return itx.editReply({ content: `Could not set this chat's persona: ${error?.message || error}` });
     }
   }
 
   if (itx.commandName === "clear") {
+    if (!itx.member?.permissions?.has?.(PermissionFlagsBits.ManageChannels) && !isGuildAdmin(itx.member)) {
+      return itx.reply({ embeds: [errorEmbed("Manage Channels permission required")], flags: MessageFlags.Ephemeral });
+    }
     await itx.deferReply({ flags: MessageFlags.Ephemeral });
     const result = await clearGuildAiChats(itx.guildId);
-    return itx.editReply({ content: `Cleared ${result.clearedHistories} saved AI conversation(s) and closed ${result.closedPrivateChats} temporary private chat(s). Public channel messages were not deleted.` });
+    let musicDeleted = 0;
+    try {
+      musicDeleted = await deleteControlRoomMessages(itx.guild);
+    } catch (e) {
+      logPretty("WARN", "Failed to clear music room: " + (e?.message || e));
+    }
+    return itx.editReply({ content: `Cleared ${result.clearedHistories} saved AI conversation(s) and closed ${result.closedPrivateChats} temporary private chat(s). Deleted ${musicDeleted} messages from music room.` });
   }
 
   if (itx.commandName === "delete") {
@@ -3142,6 +3769,9 @@ client.on("interactionCreate", async (itx) => {
   }
 
   if (itx.commandName === "deletep") {
+    if (!itx.member?.permissions?.has?.(PermissionFlagsBits.ManageMessages) && !isGuildAdmin(itx.member)) {
+      return itx.reply({ embeds: [errorEmbed("Manage Messages permission required")], flags: MessageFlags.Ephemeral });
+    }
     if (!itx.options.getBoolean("confirm", true)) {
       return itx.reply({ content: "Deletion cancelled. Run `/deletep` with `confirm: true` to remove all public AI chat messages.", flags: MessageFlags.Ephemeral });
     }
@@ -3155,6 +3785,9 @@ client.on("interactionCreate", async (itx) => {
   }
 
   if (itx.commandName === "setai") {
+    if (!itx.member?.permissions?.has?.(PermissionFlagsBits.ManageChannels) && !isGuildAdmin(itx.member)) {
+      return itx.reply({ embeds: [errorEmbed("Manage Channels permission required")], flags: MessageFlags.Ephemeral });
+    }
     await itx.deferReply({ flags: MessageFlags.Ephemeral });
     try {
       const savedChannelId = getSavedAiChannel(itx.guildId);
@@ -3223,7 +3856,7 @@ client.on("interactionCreate", async (itx) => {
   const botVC = me?.voice?.channelId;
   const sameVC = userVC && (!botVC || botVC === userVC);
 
-  const needsSameVC = !["help", "ai", "ping", "botupdate", "np", "queue", "panel", "ytstatus", "ytsignin", "ytsignout", "watchtogether", "vstate"].includes(itx.commandName);
+  const needsSameVC = !["help", "ai", "ping", "botupdate", "np", "queue", "panel", "ytstatus", "ytsignin", "ytsignout", "watchtogether", "vstate", "batchplay"].includes(itx.commandName);
 
   if (needsSameVC && !sameVC) {
     return itx.reply({ embeds: [errorEmbed("Please join the bot's voice channel first 🎙️")], flags: MessageFlags.Ephemeral });
@@ -3246,6 +3879,7 @@ client.on("interactionCreate", async (itx) => {
   }
 
   if (itx.commandName === "botupdate") {
+    if (!isGuildAdmin(itx.member)) return itx.reply({ embeds: [errorEmbed("Manage Server permission required")], flags: MessageFlags.Ephemeral });
     await itx.deferReply({ flags: MessageFlags.Ephemeral });
     await runYtDlpUpdate((msg) => itx.editReply({
       embeds: [
@@ -3282,6 +3916,7 @@ client.on("interactionCreate", async (itx) => {
     try {
       const att = itx.options.getAttachment("file");
       if (!att) return itx.editReply({ embeds: [errorEmbed("Attach the cookies.txt file")] });
+      if (att.size > 2 * 1024 * 1024) return itx.editReply({ embeds: [errorEmbed("File too large (max 2MB)")] });
       const r = await fetch(att.url);
       const text = await r.text();
       const saved = saveYTCookies(text);
@@ -3364,7 +3999,13 @@ client.on("interactionCreate", async (itx) => {
     const meta = await metaP;
     if (meta.title && meta.title !== q) item.title = meta.title;
     if (meta.thumb) item.thumb = meta.thumb;
-    if (meta.durationSec) item.durationSec = meta.durationSec;
+    if (meta.isLive) {
+      item.isLive = true;
+      item.durationSec = null;
+    } else if (meta.durationSec) {
+      item.durationSec = meta.durationSec;
+    }
+    if (meta.videoUrl) item.videoUrl = meta.videoUrl;
     const addedSlash = makeEmbed(COLORS.success)
       .setDescription(`### ➕ Added to queue`)
       .addFields(
@@ -3377,6 +4018,97 @@ client.on("interactionCreate", async (itx) => {
     return;
   }
 
+  if (itx.commandName === "stm") {
+    await itx.deferReply({ flags: MessageFlags.Ephemeral });
+    const att = itx.options.getAttachment("file");
+    const localName = itx.options.getString("name");
+
+    if (!att && !localName) {
+      return itx.editReply({
+        embeds: [errorEmbed("Please upload an audio **file** or select a local file **name** from Assets\n**Example:** `/stm file:<attachment>` or `/stm name:<song.mp3>`")]
+      });
+    }
+
+    let filePath = null;
+    let title = null;
+    let durationSec = null;
+
+    if (att) {
+      const allowedExts = [".mp3", ".wav", ".ogg", ".flac", ".m4a", ".aac", ".opus", ".webm", ".wma"];
+      const ext = path.extname(att.name || "").toLowerCase();
+      if (!allowedExts.includes(ext) && !String(att.contentType || "").startsWith("audio/")) {
+        return itx.editReply({
+          embeds: [errorEmbed(`Unsupported file type (${ext || "unknown"}). Allowed: ${allowedExts.join(", ")}`)]
+        });
+      }
+      if (att.size > 100 * 1024 * 1024) {
+        return itx.editReply({ embeds: [errorEmbed("File too large (max 100MB)")] });
+      }
+
+      const uploadsDir = path.join(config.dataDir, "uploads");
+      try { fs.mkdirSync(uploadsDir, { recursive: true }); } catch { }
+
+      const safeBase = path.basename(att.name || "audio.mp3").replace(/[^a-zA-Z0-9._-]/g, "_");
+      filePath = path.join(uploadsDir, `${Date.now()}_${safeBase}`);
+
+      try {
+        const res = await fetch(att.url);
+        if (!res.ok) throw new Error(`HTTP ${res.status} ${res.statusText}`);
+        const { Readable } = require("stream");
+        const { pipeline } = require("stream/promises");
+        await pipeline(Readable.fromWeb(res.body), fs.createWriteStream(filePath));
+      } catch (e) {
+        return itx.editReply({ embeds: [errorEmbed("Failed to download attachment: " + (e?.message || e))] });
+      }
+
+      title = att.name || safeBase;
+      const meta = await resolveAudioFileMeta(filePath);
+      durationSec = meta.durationSec;
+    } else if (localName) {
+      const assetsDir = path.resolve(__dirname, "Assets");
+      const safePath = path.resolve(assetsDir, localName);
+      if (!safePath.startsWith(assetsDir) || !fs.existsSync(safePath)) {
+        return itx.editReply({ embeds: [errorEmbed(`File \`${localName}\` not found in Assets folder`)] });
+      }
+      const st = fs.statSync(safePath);
+      if (!st.isFile()) {
+        return itx.editReply({ embeds: [errorEmbed("Target is not a valid file")] });
+      }
+
+      filePath = safePath;
+      title = path.basename(safePath);
+      const meta = await resolveAudioFileMeta(filePath);
+      durationSec = meta.durationSec;
+    }
+
+    const item = {
+      title,
+      source: filePath,
+      filePath,
+      isFile: true,
+      durationSec,
+      requestedBy: itx.user.tag,
+      guild: itx.guild,
+      voiceChannelId: userVC,
+      textChannelId: itx.channelId,
+    };
+
+    state.queue.push(item);
+    const shouldStart = !state.current;
+    if (shouldStart) playNext(itx.guild, itx.channelId, state);
+
+    const durStr = durationSec ? fmtTime(durationSec) : "Unknown duration";
+    const addedSlash = makeEmbed(COLORS.success)
+      .setDescription(`### 📁 Stream from File Added`)
+      .addFields(
+        { name: "🎵 Audio Track", value: `**${cleanTitle(item.title)}**`, inline: false },
+        { name: "⏱️ Duration", value: `\`${durStr}\``, inline: true },
+        { name: "📋 Queue position", value: `\`#${state.queue.length}\``, inline: true },
+        { name: "👤 Requested by", value: `${itx.user}`, inline: true },
+      );
+    return itx.editReply({ embeds: [addedSlash] });
+  }
+
   if (itx.commandName === "skip") {
     state.skipRequested = true;
     state.player.stop(true);
@@ -3386,6 +4118,8 @@ client.on("interactionCreate", async (itx) => {
   }
 
   if (itx.commandName === "stop") {
+    if (state.current) deleteIfUploaded(state.current);
+    state.queue.forEach(deleteIfUploaded);
     state.queue = [];
     state.current = null;
     state.startedAt = null;
@@ -3415,7 +4149,7 @@ client.on("interactionCreate", async (itx) => {
 
   if (itx.commandName === "np" || itx.commandName === "p") {
     if (!state.current) return itx.reply({ embeds: [infoEmbed("🎵 Nothing playing", "Use `/play query:<song>` to start")] });
-    const lyrNpS = await fetchLyrics(state.current.title).catch(() => null);
+    const lyrNpS = state.currentLyrics || (state.current.isFile || state.current.isLive ? null : await fetchLyrics(state.current.title).catch(() => null));
     return itx.reply({ embeds: [buildNowPlayingEmbed(state, lyrNpS)], components: buildControlRows(state) });
   }
 
@@ -3442,6 +4176,30 @@ client.on("interactionCreate", async (itx) => {
     setVolumePct(state, v);
     const bar = "█".repeat(Math.round(Math.min(state.volumePct, 200) / 20)) + "░".repeat(10 - Math.round(Math.min(state.volumePct, 200) / 20));
     return itx.reply({ embeds: [successEmbed("🔊  Volume updated", `\`${bar}\` **${state.volumePct}%**`)] });
+  }
+
+  if (itx.commandName === "lyricoffset") {
+    const sec = itx.options.getNumber("seconds");
+    state.lyricOffset = sec;
+    return itx.reply({ embeds: [successEmbed("⏱️ Lyrics Offset", `Lyrics have been shifted by **${sec > 0 ? "+" : ""}${sec}s** for this session.`)], flags: MessageFlags.Ephemeral });
+  }
+
+  // --- /batchplay: open a modal form to paste multiple links ---
+  if (itx.commandName === "batchplay") {
+    const userVCBatch = itx.member?.voice?.channelId;
+    if (!userVCBatch) return itx.reply({ embeds: [errorEmbed("Please join a voice channel first 🎙️")], flags: MessageFlags.Ephemeral });
+    const modal = new ModalBuilder()
+      .setCustomId("batch_play_modal")
+      .setTitle("📥 Batch Play — Add Multiple Songs");
+    const linksInput = new TextInputBuilder()
+      .setCustomId("batch_play_links")
+      .setLabel("Paste song links / names (one per line)")
+      .setStyle(TextInputStyle.Paragraph)
+      .setPlaceholder("https://youtube.com/watch?v=...\nhttps://open.spotify.com/track/...\nNever Gonna Give You Up\n...")
+      .setRequired(true)
+      .setMaxLength(4000);
+    modal.addComponents(new ActionRowBuilder().addComponents(linksInput));
+    return itx.showModal(modal);
   }
 
   if (itx.commandName === "playlist") {
@@ -3492,6 +4250,7 @@ client.on("interactionCreate", async (itx) => {
       return itx.reply({ embeds: [errorEmbed(`Invalid number (${state.queue.length} in the queue)`)], flags: MessageFlags.Ephemeral });
     }
     const [removed] = state.queue.splice(index - 1, 1);
+    deleteIfUploaded(removed);
     return itx.reply({ embeds: [successEmbed("🗑️  Removed from queue", `**${removed.title}**`)] });
   }
 
@@ -3532,8 +4291,28 @@ const dashLoginAttempts = new Map(); // ip -> { count, reset }
 const DASH_SESSION_TTL_MS = 12 * 3600 * 1000;
 
 function dashClientIp(req) {
+  const fwd = req.headers["x-forwarded-for"] || req.headers["cf-connecting-ip"];
+  if (typeof fwd === "string" && fwd.trim()) {
+    return fwd.split(",")[0].trim();
+  }
   return (req.socket?.remoteAddress || "unknown").toString();
 }
+function dashConstantTimeCompare(a, b) {
+  const ha = crypto.createHash("sha256").update(String(a || "")).digest();
+  const hb = crypto.createHash("sha256").update(String(b || "")).digest();
+  return crypto.timingSafeEqual(ha, hb);
+}
+// Clean up expired sessions and reset old rate limit counters every 10 min
+setInterval(() => {
+  const now = Date.now();
+  for (const [t, s] of dashSessions) {
+    if (now > s.exp) dashSessions.delete(t);
+  }
+  for (const [ip, e] of dashLoginAttempts) {
+    if (now > e.reset) dashLoginAttempts.delete(ip);
+  }
+}, 10 * 60 * 1000).unref?.();
+
 function dashRateLimited(ip) {
   const now = Date.now();
   const e = dashLoginAttempts.get(ip);
@@ -3645,7 +4424,7 @@ function dashGuilds() {
         id, name: g.name,
         botVC: g.members.me?.voice?.channelId || null,
         voice,
-        nowPlaying: st?.current ? { title: st.current.title, by: st.current.requestedBy, thumb: st.current.thumb || thumbFor(st.current.source), durationSec: st.current.durationSec || null, startedAt: st.startedAt || null, posBase: st.posBase || 0, lyrics: st.currentLyrics } : null,
+        nowPlaying: st?.current ? { title: st.current.title, by: st.current.requestedBy, thumb: st.current.thumb || thumbFor(st.current.source), durationSec: st.current.durationSec || null, startedAt: st.startedAt || null, posBase: st.posBase || 0, positionSec: playbackSeconds(st), lyrics: st.currentLyrics } : null,
         queue: st ? st.queue.slice(0, 20).map((x) => ({ title: x.title, by: x.requestedBy })) : [],
         queueCount: st?.queue.length || 0,
         volume: st?.volumePct ?? config.defaultVolume,
@@ -3686,6 +4465,7 @@ async function dashPlay(guildId, query) {
   if (meta.title && meta.title !== q) item.title = meta.title;
   if (meta.thumb) item.thumb = meta.thumb;
   if (meta.durationSec) item.durationSec = meta.durationSec;
+  if (meta.videoUrl) item.videoUrl = meta.videoUrl;
   logPretty("COMMAND", "WEB /play", { user: "dashboard", guild: guild.name, tail: item.title });
   return { title: item.title, position: state.queue.length };
 }
@@ -3738,7 +4518,7 @@ function dashControl(guildId, action, value) {
     state.queue.unshift({ title: prev.title, source: prev.source, thumb: prev.thumb || null, durationSec: prev.durationSec || null, requestedBy: prev.requestedBy || ("dashboard:" + config.dashboardUser), guild, voiceChannelId: uvc, textChannelId: firstTextChannelId(guild) });
     state.skipRequested = true;
     state.prevJump = true;
-    try { state.player.stop(true); } catch {}
+    try { state.player.stop(true); } catch { }
     cleanupCurrentPipeline(state);
     return prev.title;
   }
@@ -4028,112 +4808,137 @@ if(window.AOS)AOS.init({once:true,duration:520,offset:22,disable:window.matchMed
 }
 function dashPlayerPageTailwind() {
   return '<!doctype html><html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>Bocchi · Web Player</title>'
-  + '<script src="https://cdn.tailwindcss.com"></script><link href="https://unpkg.com/aos@2.3.4/dist/aos.css" rel="stylesheet">'
-  + '<style>body{background-color:#090c10;background-image:linear-gradient(rgba(255,255,255,.025) 1px,transparent 1px),linear-gradient(90deg,rgba(255,255,255,.025) 1px,transparent 1px);background-size:32px 32px}input:focus,select:focus{outline:2px solid #e8b34c;outline-offset:2px}::-webkit-scrollbar{width:6px;height:6px}::-webkit-scrollbar-track{background:transparent}::-webkit-scrollbar-thumb{background:#27272a;border-radius:3px}::-webkit-scrollbar-thumb:hover{background:#3f3f46}@keyframes live-pulse{0%,100%{opacity:1}50%{opacity:.4}}#live-dot{animation:live-pulse 1.5s ease-in-out infinite}</style></head><body class="min-h-screen text-zinc-100 antialiased">'
-  + '<main class="mx-auto max-w-5xl px-4 py-6 sm:px-6 sm:py-10"><header class="mb-8 flex flex-wrap items-center justify-between gap-4 border-b border-white/10 pb-5" data-aos="fade-down"><div class="flex items-center gap-3"><span class="grid h-10 w-10 place-items-center bg-amber-300 text-xl font-black text-zinc-950">♪</span><div><p class="text-sm font-semibold">Bocchi player</p><p class="font-mono text-[10px] text-zinc-500">LISTENING ROOM</p></div></div><div class="flex flex-wrap items-center gap-2"><a class="px-3 py-2 text-xs text-zinc-400 hover:text-amber-200" href="/dashboard">← Control desk</a><select id="srv" class="border border-white/10 bg-[#10151b] px-3 py-2 text-sm"></select><select id="chn" class="border border-white/10 bg-[#10151b] px-3 py-2 text-sm"></select><button class="border border-white/15 px-3 py-2 text-xs hover:border-amber-300" onclick="P.join()">Join voice</button><button class="border border-white/15 px-3 py-2 text-xs hover:border-rose-300" onclick="P.leave()">Leave</button></div></header>'
-  + '<section class="grid gap-6 md:grid-cols-[minmax(0,1.2fr)_minmax(280px,.8fr)] items-start" data-aos="fade-up"><div class="border border-white/10 bg-[#10151b] p-4 sm:p-6"><div id="cover-wrap" class="mb-5 aspect-video w-full overflow-hidden border border-white/10 bg-gradient-to-br from-zinc-900 via-zinc-800 to-zinc-900 flex items-center justify-center"><img id="cover" class="h-full w-full object-cover hidden" alt="Album art" onerror="this.classList.add(\'hidden\');document.getElementById(\'cover-ph\').classList.remove(\'hidden\')"><div id="cover-ph" class="flex flex-col items-center gap-2 text-zinc-600"><span class="text-5xl">♪</span><span class="text-xs font-mono">NO ART</span></div></div><p class="font-mono text-[10px] uppercase text-amber-300">Now playing</p><h1 id="ttl" class="mt-2 break-words text-2xl font-semibold sm:text-3xl">— idle —</h1><p id="by" class="mt-2 text-sm text-zinc-400"></p>'
-  + '<div id="lyrics-container" class="mt-6 h-56 overflow-y-auto scroll-smooth rounded bg-[#090c10] p-4 text-center font-medium leading-loose text-zinc-400 hidden shadow-inner border border-white/5" style="-webkit-mask-image: linear-gradient(transparent, black 15%, black 85%, transparent); mask-image: linear-gradient(transparent, black 15%, black 85%, transparent);"></div>'
-  + '<div class="mt-5"><div id="timebar" class="h-2 cursor-pointer rounded-full bg-white/10" title="Click to seek"><div id="tfill" class="h-full w-0 rounded-full bg-amber-300"></div></div><div class="mt-1 flex justify-between font-mono text-[11px] text-zinc-500"><span id="tcur">0:00</span><span id="tdur">• LIVE</span></div></div>'
-  + '<div class="mt-6 flex flex-wrap items-center gap-2"><button class="h-11 w-12 border border-white/10 text-lg hover:border-amber-300" onclick="P.ctl(\'prev\')" title="Previous">⏮</button><button id="pp" class="h-11 w-12 bg-amber-300 text-lg text-zinc-950 hover:bg-amber-200" onclick="P.toggle()" title="Play or pause">▶️</button><button class="h-11 w-12 border border-white/10 text-lg hover:border-amber-300" onclick="P.ctl(\'skip\')" title="Skip">⏭</button><button class="h-11 w-12 border border-rose-400/30 text-lg text-rose-300 hover:bg-rose-400/10" onclick="P.ctl(\'stop\')" title="Stop">■</button><div class="ml-auto flex items-center gap-2"><button class="h-11 w-12 border border-white/10 text-lg hover:border-amber-300" onclick="document.getElementById(\'q\').scrollIntoView({behavior:\'smooth\'})" title="List">📋</button><button id="loopb" class="h-11 border border-white/10 px-3 text-xs hover:border-amber-300" onclick="P.loop()">Loop · Off</button></div></div>'
-  + '<div class="mt-5 flex flex-wrap items-center gap-3 border-t border-white/5 pt-5"><label class="font-mono text-xs text-zinc-500" for="vol">VOLUME</label><input id="vol" class="min-w-32 flex-1 accent-amber-300" type="range" min="0" max="200" value="100"><button class="border border-white/10 px-3 py-2 text-xs hover:border-amber-300" onclick="P.vol()">Apply</button></div><div class="mt-5 flex gap-2"><input id="q2" type="text" placeholder="Search or paste a link" class="min-w-0 flex-1 border border-white/10 bg-[#090c10] px-3 py-3 text-sm placeholder:text-zinc-600"><button class="bg-amber-300 px-4 py-3 text-sm font-semibold text-zinc-950 hover:bg-amber-200" onclick="P.play()">Queue</button></div><p id="msg" class="mt-3 min-h-5 text-xs text-zinc-500 truncate" title=""></p></div>'
-  + '<aside class="border border-white/10 bg-[#10151b] p-4 sm:p-6 md:sticky md:top-6 md:max-h-[calc(100vh-3rem)] md:overflow-y-auto" data-aos="fade-up" data-aos-delay="100"><div class="mb-4 flex items-end justify-between"><div><p class="font-mono text-[10px] uppercase text-zinc-500">Next tracks</p><h2 class="mt-1 text-lg font-semibold">Up next</h2></div><span class="text-amber-300">☷</span></div><ol id="q" class="divide-y divide-white/5 text-sm text-zinc-300"></ol></aside></section></main>'
-  + '<script src="https://unpkg.com/aos@2.3.4/dist/aos.js"></script><script>'
-  + 'var PG={g:[],id:"",snap:null,snapAt:0};'
-  + 'function say(t){document.getElementById("msg").textContent=t;}'
-  + 'function gid(){var s=document.getElementById("srv");return s&&s.value?s.value:"";}'
-  + 'async function api(p,d){var r=await fetch(p,{method:d?"POST":"GET",headers:{"Content-Type":"application/json"},body:d?JSON.stringify(d):undefined});var j=null;try{j=await r.json();}catch(e){}if(!r.ok||(j&&j.error))throw new Error((j&&j.error)||("HTTP "+r.status));return j;}'
-  + 'async function load(){try{var g=await(await fetch("/api/guilds")).json();PG.g=g;var s=document.getElementById("srv");var keep=s.value;s.innerHTML="";g.forEach(function(x){var o=document.createElement("option");o.value=x.id;o.textContent=x.name;if(x.id===keep)o.selected=true;s.appendChild(o);});if(!s.value&&g.length)s.value=g[0].id;chans();refresh();}catch(e){say("load failed: "+e.message);}}'
-  + 'function cur(){var id=gid();for(var i=0;i<PG.g.length;i++)if(PG.g[i].id===id)return PG.g[i];return null;}'
-  + 'function chans(){var g=cur();var c=document.getElementById("chn");c.innerHTML="";if(!g)return;(g.voice||[]).forEach(function(x){var o=document.createElement("option");o.value=x.id;o.textContent=x.name+" · "+x.members;if(g.botVC===x.id)o.selected=true;c.appendChild(o);});}'
-  + 'var P={'
-  + 'join:async function(){try{var j=await api("/api/join",{guildId:gid(),channelId:document.getElementById("chn").value});say("Joined "+j.channel);load();}catch(e){say("Join failed: "+e.message);}},'
-  + 'leave:async function(){try{await api("/api/leave",{guildId:gid()});say("Left voice");load();}catch(e){say(e.message);}},'
-  + 'play:async function(){var q=document.getElementById("q2").value;if(!q){say("Enter a song first.");return;}try{var j=await api("/api/play",{guildId:gid(),query:q});say("Queued: "+j.title);document.getElementById("q2").value="";refresh();}catch(e){say("Queue failed: "+e.message);}},'
-  + 'ctl:async function(a){try{var j=await api("/api/ctl",{guildId:gid(),action:a});say(j.result);refresh();}catch(e){say(e.message);}},'
-  + 'toggle:async function(){var g=cur();var paused=g&&g.player==="paused";try{var j=await api("/api/ctl",{guildId:gid(),action:paused?"resume":"pause"});say(j.result);refresh();}catch(e){say(e.message);}},'
-  + 'loop:async function(){var g=cur();var nx=g&&g.loop==="off"?"track":(g&&g.loop==="track"?"queue":"off");try{await api("/api/loop",{guildId:gid(),mode:nx});refresh();}catch(e){say(e.message);}},'
-  + 'vol:async function(){try{var j=await api("/api/volume",{guildId:gid(),value:Number(document.getElementById("vol").value)});say("Volume "+j.result+"%");refresh();}catch(e){say(e.message);}}'
-  + '};'
-  + 'async function refresh(){if(!gid())return;try{PG.g=await(await fetch("/api/guilds")).json();PG.snap=cur();PG.snapAt=Date.now();paint();}catch(e){}}'
-  + 'function paint(){var g=PG.snap;if(!g)return;var n=g.nowPlaying;document.getElementById("ttl").textContent=n?n.title:"\u2014 idle \u2014";document.getElementById("by").textContent=n?"Requested by "+n.by:"Choose a server and queue a track.";var c=document.getElementById("cover");var ph=document.getElementById("cover-ph");if(n&&n.thumb){c.classList.remove("hidden");ph.classList.add("hidden");if(c.getAttribute("src")!==n.thumb)c.src=n.thumb;}else{c.classList.add("hidden");ph.classList.remove("hidden");}'
-  + 'var lc=document.getElementById("lyrics-container");if(n&&n.lyrics&&n.lyrics.synced&&n.lyrics.synced.length){lc.classList.remove("hidden");if(lc.dataset.title!==n.title){lc.innerHTML="";lc.dataset.title=n.title;n.lyrics.synced.forEach(function(l){var p=document.createElement("p");p.className="lyric-line transition-all duration-300";p.dataset.time=l.t;p.textContent=l.text||"♪";lc.appendChild(p);});}var sp=n.speed||1;var base=n.posBase||0;var t0=n.startedAt||PG.snapAt;var el=base+Math.max(0,(Date.now()-t0)/1000)*sp;var lines=Array.from(lc.children);var aIdx=-1;for(var i=0;i<lines.length;i++){if(parseFloat(lines[i].dataset.time)<=el)aIdx=i;else break;}lines.forEach(function(p,i){if(i===aIdx){if(!p.classList.contains("active")){p.classList.add("active");p.style.color="#fcd34d";p.style.transform="scale(1.1)";lc.scrollTop=p.offsetTop-lc.offsetTop-(lc.clientHeight/2)+(p.clientHeight/2);}}else{p.classList.remove("active");p.style.color="";p.style.transform="";}});}else{lc.classList.add("hidden");lc.dataset.title="";}'
-  + 'var dur=n&&n.durationSec?n.durationSec:null;var spp=(n&&n.speed)||1;var bs=(n&&n.posBase)||0;var t0b=(n&&n.startedAt)?n.startedAt:PG.snapAt;var elb=bs+Math.max(0,(Date.now()-t0b)/1000)*spp;document.getElementById("tcur").textContent=fmtT(elb);if(dur){document.getElementById("tdur").textContent=fmtT(dur);var pct=Math.max(0,Math.min(100,elb/dur*100));document.getElementById("tfill").style.width=pct+"%";document.getElementById("timebar").title="Click to seek";}else{document.getElementById("tdur").innerHTML="<span id=\'live-dot\' style=\'display:inline-block;width:8px;height:8px;border-radius:50%;background:#fcd34d;margin-right:4px;animation:live-pulse 1.5s ease-in-out infinite\'></span>LIVE";document.getElementById("tfill").style.width="100%";document.getElementById("tfill").style.opacity="0.25";document.getElementById("timebar").title="Live stream — cannot seek";}'
-  + 'document.getElementById("pp").textContent=g.player==="paused"?"▶️":"⏸️";document.getElementById("loopb").textContent="Loop · "+g.loop;var v=document.getElementById("vol");if(document.activeElement!==v)v.value=g.volume;var q=document.getElementById("q");q.innerHTML="";(g.queue||[]).forEach(function(x){var li=document.createElement("li");li.className="flex gap-3 py-3";var index=document.createElement("span");index.className="font-mono text-xs text-amber-300";index.textContent=String(q.children.length+1).padStart(2,"0");var title=document.createElement("span");title.className="min-w-0 truncate";title.textContent=x.title||"";li.appendChild(index);li.appendChild(title);q.appendChild(li);});if(!q.children.length){var empty=document.createElement("li");empty.className="py-4 text-sm text-zinc-500";empty.textContent="Queue is empty";q.appendChild(empty);}}'
-  + 'function fmtT(s){if(s==null||!isFinite(s)||s<0)return"• LIVE";s=Math.floor(s);var m=Math.floor(s/60);s=s%60;return m+":"+(s<10?"0":"")+s;}'
-  + 'document.getElementById("timebar").addEventListener("click",async function(ev){var g=cur();if(!g||!g.nowPlaying||!g.nowPlaying.durationSec){say("Live stream — cannot seek");return;}var r=this.getBoundingClientRect();var ratio=Math.max(0,Math.min(1,(ev.clientX-r.left)/r.width));var sec=Math.floor(ratio*g.nowPlaying.durationSec);try{await api("/api/seek",{guildId:gid(),seconds:sec});say("Seek → "+fmtT(sec));refresh();}catch(e){say(e.message);}});'
-  + 'document.getElementById("srv").addEventListener("change",function(){chans();refresh();});if(window.AOS)AOS.init({once:true,duration:520,offset:22,disable:window.matchMedia("(prefers-reduced-motion: reduce)").matches});setInterval(refresh,5000);setInterval(paint,500);load();'
-  + '</script></body></html>';
+    + '<script src="https://cdn.tailwindcss.com"></script><link href="https://unpkg.com/aos@2.3.4/dist/aos.css" rel="stylesheet">'
+    + '<style>body{background-color:#090c10;background-image:linear-gradient(rgba(255,255,255,.025) 1px,transparent 1px),linear-gradient(90deg,rgba(255,255,255,.025) 1px,transparent 1px);background-size:32px 32px}input:focus,select:focus{outline:2px solid #e8b34c;outline-offset:2px}::-webkit-scrollbar{width:6px;height:6px}::-webkit-scrollbar-track{background:transparent}::-webkit-scrollbar-thumb{background:#27272a;border-radius:3px}::-webkit-scrollbar-thumb:hover{background:#3f3f46}@keyframes live-pulse{0%,100%{opacity:1}50%{opacity:.4}}#live-dot{animation:live-pulse 1.5s ease-in-out infinite}</style></head><body class="min-h-screen text-zinc-100 antialiased">'
+    + '<main class="mx-auto max-w-5xl px-4 py-6 sm:px-6 sm:py-10"><header class="mb-8 flex flex-wrap items-center justify-between gap-4 border-b border-white/10 pb-5" data-aos="fade-down"><div class="flex items-center gap-3"><span class="grid h-10 w-10 place-items-center bg-amber-300 text-xl font-black text-zinc-950">♪</span><div><p class="text-sm font-semibold">Bocchi player</p><p class="font-mono text-[10px] text-zinc-500">LISTENING ROOM</p></div></div><div class="flex flex-wrap items-center gap-2"><a class="px-3 py-2 text-xs text-zinc-400 hover:text-amber-200" href="/dashboard">← Control desk</a><select id="srv" class="border border-white/10 bg-[#10151b] px-3 py-2 text-sm"></select><select id="chn" class="border border-white/10 bg-[#10151b] px-3 py-2 text-sm"></select><button class="border border-white/15 px-3 py-2 text-xs hover:border-amber-300" onclick="P.join()">Join voice</button><button class="border border-white/15 px-3 py-2 text-xs hover:border-rose-300" onclick="P.leave()">Leave</button></div></header>'
+    + '<section class="grid gap-6 md:grid-cols-[minmax(0,1.2fr)_minmax(280px,.8fr)] items-start" data-aos="fade-up"><div class="border border-white/10 bg-[#10151b] p-4 sm:p-6"><div id="cover-wrap" class="mb-5 aspect-video w-full overflow-hidden border border-white/10 bg-gradient-to-br from-zinc-900 via-zinc-800 to-zinc-900 flex items-center justify-center"><img id="cover" class="h-full w-full object-cover hidden" alt="Album art" onerror="this.classList.add(\'hidden\');document.getElementById(\'cover-ph\').classList.remove(\'hidden\')"><div id="cover-ph" class="flex flex-col items-center gap-2 text-zinc-600"><span class="text-5xl">♪</span><span class="text-xs font-mono">NO ART</span></div></div><p class="font-mono text-[10px] uppercase text-amber-300">Now playing</p><h1 id="ttl" class="mt-2 break-words text-2xl font-semibold sm:text-3xl">— idle —</h1><p id="by" class="mt-2 text-sm text-zinc-400"></p>'
+    + '<div id="lyrics-container" class="mt-6 h-56 overflow-y-auto scroll-smooth rounded bg-[#090c10] p-4 text-center font-medium leading-loose text-zinc-400 hidden shadow-inner border border-white/5" style="-webkit-mask-image: linear-gradient(transparent, black 15%, black 85%, transparent); mask-image: linear-gradient(transparent, black 15%, black 85%, transparent);"></div>'
+    + '<div class="mt-5"><div id="timebar" class="h-2 cursor-pointer rounded-full bg-white/10" title="Click to seek"><div id="tfill" class="h-full w-0 rounded-full bg-amber-300"></div></div><div class="mt-1 flex justify-between font-mono text-[11px] text-zinc-500"><span id="tcur">0:00</span><span id="tdur">• LIVE</span></div></div>'
+    + '<div class="mt-6 flex flex-wrap items-center gap-2"><button class="h-11 w-12 border border-white/10 text-lg hover:border-amber-300" onclick="P.ctl(\'prev\')" title="Previous">⏮</button><button id="pp" class="h-11 w-12 bg-amber-300 text-lg text-zinc-950 hover:bg-amber-200" onclick="P.toggle()" title="Play or pause">▶️</button><button class="h-11 w-12 border border-white/10 text-lg hover:border-amber-300" onclick="P.ctl(\'skip\')" title="Skip">⏭</button><button class="h-11 w-12 border border-rose-400/30 text-lg text-rose-300 hover:bg-rose-400/10" onclick="P.ctl(\'stop\')" title="Stop">■</button><div class="ml-auto flex items-center gap-2"><button class="h-11 w-12 border border-white/10 text-lg hover:border-amber-300" onclick="document.getElementById(\'q\').scrollIntoView({behavior:\'smooth\'})" title="List">📋</button><button id="loopb" class="h-11 border border-white/10 px-3 text-xs hover:border-amber-300" onclick="P.loop()">Loop · Off</button></div></div>'
+    + '<div class="mt-5 flex flex-wrap items-center gap-3 border-t border-white/5 pt-5"><label class="font-mono text-xs text-zinc-500" for="vol">VOLUME</label><input id="vol" class="min-w-32 flex-1 accent-amber-300" type="range" min="0" max="200" value="100"><button class="border border-white/10 px-3 py-2 text-xs hover:border-amber-300" onclick="P.vol()">Apply</button></div><div class="mt-5 flex gap-2"><input id="q2" type="text" placeholder="Search or paste a link" class="min-w-0 flex-1 border border-white/10 bg-[#090c10] px-3 py-3 text-sm placeholder:text-zinc-600"><button class="bg-amber-300 px-4 py-3 text-sm font-semibold text-zinc-950 hover:bg-amber-200" onclick="P.play()">Queue</button></div><p id="msg" class="mt-3 min-h-5 text-xs text-zinc-500 truncate" title=""></p></div>'
+    + '<aside class="border border-white/10 bg-[#10151b] p-4 sm:p-6 md:sticky md:top-6 md:max-h-[calc(100vh-3rem)] md:overflow-y-auto" data-aos="fade-up" data-aos-delay="100"><div class="mb-4 flex items-end justify-between"><div><p class="font-mono text-[10px] uppercase text-zinc-500">Next tracks</p><h2 class="mt-1 text-lg font-semibold">Up next</h2></div><span class="text-amber-300">☷</span></div><ol id="q" class="divide-y divide-white/5 text-sm text-zinc-300"></ol></aside></section></main>'
+    + '<script src="https://unpkg.com/aos@2.3.4/dist/aos.js"></script><script>'
+    + 'var PG={g:[],id:"",snap:null,snapAt:0};'
+    + 'function say(t){document.getElementById("msg").textContent=t;}'
+    + 'function gid(){var s=document.getElementById("srv");return s&&s.value?s.value:"";}'
+    + 'async function api(p,d){var r=await fetch(p,{method:d?"POST":"GET",headers:{"Content-Type":"application/json"},body:d?JSON.stringify(d):undefined});var j=null;try{j=await r.json();}catch(e){}if(!r.ok||(j&&j.error))throw new Error((j&&j.error)||("HTTP "+r.status));return j;}'
+    + 'async function load(){try{var g=await(await fetch("/api/guilds")).json();PG.g=g;var s=document.getElementById("srv");var keep=s.value;s.innerHTML="";g.forEach(function(x){var o=document.createElement("option");o.value=x.id;o.textContent=x.name;if(x.id===keep)o.selected=true;s.appendChild(o);});if(!s.value&&g.length)s.value=g[0].id;chans();refresh();}catch(e){say("load failed: "+e.message);}}'
+    + 'function cur(){var id=gid();for(var i=0;i<PG.g.length;i++)if(PG.g[i].id===id)return PG.g[i];return null;}'
+    + 'function chans(){var g=cur();var c=document.getElementById("chn");c.innerHTML="";if(!g)return;(g.voice||[]).forEach(function(x){var o=document.createElement("option");o.value=x.id;o.textContent=x.name+" · "+x.members;if(g.botVC===x.id)o.selected=true;c.appendChild(o);});}'
+    + 'var P={'
+    + 'join:async function(){try{var j=await api("/api/join",{guildId:gid(),channelId:document.getElementById("chn").value});say("Joined "+j.channel);load();}catch(e){say("Join failed: "+e.message);}},'
+    + 'leave:async function(){try{await api("/api/leave",{guildId:gid()});say("Left voice");load();}catch(e){say(e.message);}},'
+    + 'play:async function(){var q=document.getElementById("q2").value;if(!q){say("Enter a song first.");return;}try{var j=await api("/api/play",{guildId:gid(),query:q});say("Queued: "+j.title);document.getElementById("q2").value="";refresh();}catch(e){say("Queue failed: "+e.message);}},'
+    + 'ctl:async function(a){try{var j=await api("/api/ctl",{guildId:gid(),action:a});say(j.result);refresh();}catch(e){say(e.message);}},'
+    + 'toggle:async function(){var g=cur();var paused=g&&g.player==="paused";try{var j=await api("/api/ctl",{guildId:gid(),action:paused?"resume":"pause"});say(j.result);refresh();}catch(e){say(e.message);}},'
+    + 'loop:async function(){var g=cur();var nx=g&&g.loop==="off"?"track":(g&&g.loop==="track"?"queue":"off");try{await api("/api/loop",{guildId:gid(),mode:nx});refresh();}catch(e){say(e.message);}},'
+    + 'vol:async function(){try{var j=await api("/api/volume",{guildId:gid(),value:Number(document.getElementById("vol").value)});say("Volume "+j.result+"%");refresh();}catch(e){say(e.message);}}'
+    + '};'
+    + 'async function refresh(){if(!gid())return;try{PG.g=await(await fetch("/api/guilds")).json();PG.snap=cur();PG.snapAt=Date.now();paint();}catch(e){}}'
+    + 'function paint(){var g=PG.snap;if(!g)return;var n=g.nowPlaying;document.getElementById("ttl").textContent=n?n.title:"\u2014 idle \u2014";document.getElementById("by").textContent=n?"Requested by "+n.by:"Choose a server and queue a track.";var c=document.getElementById("cover");var ph=document.getElementById("cover-ph");if(n&&n.thumb){c.classList.remove("hidden");ph.classList.add("hidden");if(c.getAttribute("src")!==n.thumb)c.src=n.thumb;}else{c.classList.add("hidden");ph.classList.remove("hidden");}'
+    + 'var lc=document.getElementById("lyrics-container");if(n&&n.lyrics&&n.lyrics.synced&&n.lyrics.synced.length){lc.classList.remove("hidden");if(lc.dataset.title!==n.title){lc.innerHTML="";lc.dataset.title=n.title;n.lyrics.synced.forEach(function(l){var p=document.createElement("p");p.className="lyric-line transition-all duration-300";p.dataset.time=l.t;p.textContent=l.text||"♪";lc.appendChild(p);});}var sp=n.speed||1;var el=(n.positionSec!=null)?(n.positionSec+Math.max(0,(Date.now()-PG.snapAt)/1000)):((n.posBase||0)+Math.max(0,(Date.now()-(n.startedAt||PG.snapAt))/1000)*sp);var lines=Array.from(lc.children);var aIdx=-1;for(var i=0;i<lines.length;i++){if(parseFloat(lines[i].dataset.time)<=el)aIdx=i;else break;}lines.forEach(function(p,i){if(i===aIdx){if(!p.classList.contains("active")){p.classList.add("active");p.style.color="#fcd34d";p.style.transform="scale(1.1)";lc.scrollTop=p.offsetTop-lc.offsetTop-(lc.clientHeight/2)+(p.clientHeight/2);}}else{p.classList.remove("active");p.style.color="";p.style.transform="";}});}else{lc.classList.add("hidden");lc.dataset.title="";}'
+    + 'var dur=n&&n.durationSec?n.durationSec:null;var elb=(n&&n.positionSec!=null)?(n.positionSec+Math.max(0,(Date.now()-PG.snapAt)/1000)):(((n&&n.posBase)||0)+Math.max(0,(Date.now()-((n&&n.startedAt)?n.startedAt:PG.snapAt))/1000)*((n&&n.speed)||1));document.getElementById("tcur").textContent=fmtT(elb);if(dur){document.getElementById("tdur").textContent=fmtT(dur);var pct=Math.max(0,Math.min(100,elb/dur*100));document.getElementById("tfill").style.width=pct+"%";document.getElementById("timebar").title="Click to seek";}else{document.getElementById("tdur").innerHTML="<span id=\'live-dot\' style=\'display:inline-block;width:8px;height:8px;border-radius:50%;background:#fcd34d;margin-right:4px;animation:live-pulse 1.5s ease-in-out infinite\'></span>LIVE";document.getElementById("tfill").style.width="100%";document.getElementById("tfill").style.opacity="0.25";document.getElementById("timebar").title="Live stream — cannot seek";}'
+    + 'document.getElementById("pp").textContent=g.player==="paused"?"▶️":"⏸️";document.getElementById("loopb").textContent="Loop · "+g.loop;var v=document.getElementById("vol");if(document.activeElement!==v)v.value=g.volume;var q=document.getElementById("q");q.innerHTML="";(g.queue||[]).forEach(function(x){var li=document.createElement("li");li.className="flex gap-3 py-3";var index=document.createElement("span");index.className="font-mono text-xs text-amber-300";index.textContent=String(q.children.length+1).padStart(2,"0");var title=document.createElement("span");title.className="min-w-0 truncate";title.textContent=x.title||"";li.appendChild(index);li.appendChild(title);q.appendChild(li);});if(!q.children.length){var empty=document.createElement("li");empty.className="py-4 text-sm text-zinc-500";empty.textContent="Queue is empty";q.appendChild(empty);}}'
+    + 'function fmtT(s){if(s==null||!isFinite(s)||s<0)return"• LIVE";s=Math.floor(s);var m=Math.floor(s/60);s=s%60;return m+":"+(s<10?"0":"")+s;}'
+    + 'document.getElementById("timebar").addEventListener("click",async function(ev){var g=cur();if(!g||!g.nowPlaying||!g.nowPlaying.durationSec){say("Live stream — cannot seek");return;}var r=this.getBoundingClientRect();var ratio=Math.max(0,Math.min(1,(ev.clientX-r.left)/r.width));var sec=Math.floor(ratio*g.nowPlaying.durationSec);try{await api("/api/seek",{guildId:gid(),seconds:sec});say("Seek → "+fmtT(sec));refresh();}catch(e){say(e.message);}});'
+    + 'document.getElementById("srv").addEventListener("change",function(){chans();refresh();});if(window.AOS)AOS.init({once:true,duration:520,offset:22,disable:window.matchMedia("(prefers-reduced-motion: reduce)").matches});setInterval(refresh,5000);setInterval(paint,500);load();'
+    + '</script></body></html>';
 }
 
 function dashPlayerPage() {
   return '<!doctype html><html><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>Music Bot — Web Player</title>'
-  + '<style>body{font-family:system-ui;background:#0b1020;color:#e2e8f0;margin:0;padding:20px}.wrap{max-width:720px;margin:0 auto}.top{display:flex;gap:8px;align-items:center;margin-bottom:12px;flex-wrap:wrap}a{color:#93c5fd}select,input[type=text]{padding:8px;border-radius:8px;border:1px solid #334155;background:#020617;color:#e2e8f0}.card{background:#141b31;border:1px solid #263154;padding:18px;border-radius:14px;margin:12px 0}.cover{width:100%;max-height:340px;object-fit:cover;border-radius:10px;background:#000;display:none}#ttl{font-size:20px;font-weight:800;margin:12px 0 2px}#by{color:#94a3b8;font-size:13px}#barwrap{margin:14px 0 4px;cursor:pointer}#bar{height:8px;background:#263154;border-radius:99px;position:relative}#fill{height:100%;width:0%;background:#5865F2;border-radius:99px}#knob{width:14px;height:14px;background:#fff;border-radius:99px;position:absolute;top:-3px;left:0%}#times{display:flex;justify-content:space-between;font-size:12px;color:#94a3b8}.row{display:flex;gap:8px;margin-top:12px;flex-wrap:wrap;align-items:center}button{padding:10px 16px;border:0;border-radius:10px;background:#5865F2;color:#fff;font-weight:700;cursor:pointer;font-size:15px}.ghost{background:#334155}.danger{background:#b91c1c}.vol{display:flex;gap:8px;align-items:center}input[type=range]{width:140px}#q{margin:8px 0 0;padding-left:20px;font-size:14px}#msg{color:#94a3b8;font-size:13px;min-height:18px;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}::-webkit-scrollbar{width:6px;height:6px}::-webkit-scrollbar-track{background:transparent}::-webkit-scrollbar-thumb{background:#334155;border-radius:3px}</style></head><body><div class="wrap">'
-  + '<div class="top"><a href="/dashboard">← Dashboard</a><select id="srv"></select><select id="chn"></select><button class="ghost" onclick="P.join()">Join</button><button class="ghost" onclick="P.leave()">Leave</button></div>'
-  + '<div class="card"><img id="cover" class="cover" alt=""><div id="ttl">— idle —</div><div id="by"></div>'
-  + '<div id="lyrics-container" style="display:none; height:220px; overflow-y:auto; scroll-behavior:smooth; margin:16px 0; padding:12px; background:#020617; border-radius:8px; border:1px solid #334155; text-align:center; color:#94a3b8; font-size:15px; line-height:1.8; -webkit-mask-image: linear-gradient(transparent, black 15%, black 85%, transparent); mask-image: linear-gradient(transparent, black 15%, black 85%, transparent);"></div>'
-  + '<div id="barwrap" onclick="P.seek(event)"><div id="bar"><div id="fill"></div><div id="knob"></div></div></div>'
-  + '<div id="times"><span id="tcur">0:00</span><span id="ttot">• LIVE</span></div>'
-  + '<div class="row"><button onclick="P.ctl(\'prev\')">⏮</button><button id="pp" onclick="P.toggle()">▶</button><button onclick="P.ctl(\'skip\')">⏭</button><button class="danger" onclick="P.ctl(\'stop\')">⏹</button><button class="ghost" onclick="document.getElementById(\'q\').scrollIntoView({behavior:\'smooth\'})">📋</button><button class="ghost" id="loopb" onclick="P.loop()">🔁 off</button></div>'
-  + '<div class="row vol"><span>🔊</span><input id="vol" type="range" min="0" max="200" value="100"><button class="ghost" onclick="P.vol()">Set</button></div>'
-  + '<div class="row"><input id="q2" type="text" placeholder="song name or URL" style="flex:1;min-width:200px"><button onclick="P.play()">+ Queue</button></div>'
-  + '<div id="msg"></div></div>'
-  + '<div class="card"><h3 style="margin:0 0 8px">📋 Up next</h3><ol id="q"></ol></div>'
-  + '</div><script>'
-  + 'var PG={g:[],id:"",snap:null,snapAt:0};'
-  + 'function esc(s){return String(s==null?"":s).replace(/&/g,"&amp;").replace(/</g,"&lt;").replace(/>/g,"&gt;");}'
-  + 'function say(t){document.getElementById("msg").textContent=t;}'
-  + 'function gid(){var s=document.getElementById("srv");return s&&s.value?s.value:"";}'
-  + 'function fmt(s){if(s==null||!isFinite(s)||s<0)return"• LIVE";s=Math.floor(s);var m=Math.floor(s/60);s=s%60;return m+":"+(s<10?"0":"")+s;}'
-  + 'async function api(p,d){var r=await fetch(p,{method:d?"POST":"GET",headers:{"Content-Type":"application/json"},body:d?JSON.stringify(d):undefined});var j=null;try{j=await r.json();}catch(e){}if(!r.ok||(j&&j.error))throw new Error((j&&j.error)||("HTTP "+r.status));return j;}'
-  + 'async function load(){try{var g=await(await fetch("/api/guilds")).json();PG.g=g;var s=document.getElementById("srv");var keep=s.value;s.innerHTML="";g.forEach(function(x){var o=document.createElement("option");o.value=x.id;o.textContent=x.name;if(x.id===keep)o.selected=true;s.appendChild(o);});if(!s.value&&g.length)s.value=g[0].id;chans();refresh();}catch(e){say("load failed: "+e.message);}}'
-  + 'function cur(){var id=gid();for(var i=0;i<PG.g.length;i++)if(PG.g[i].id===id)return PG.g[i];return null;}'
-  + 'function chans(){var g=cur();var c=document.getElementById("chn");c.innerHTML="";if(!g)return;(g.voice||[]).forEach(function(x){var o=document.createElement("option");o.value=x.id;o.textContent=x.name+" ("+x.members+")";if(g.botVC===x.id)o.selected=true;c.appendChild(o);});}'
-  + 'var P={'
-  + 'join:async function(){try{var j=await api("/api/join",{guildId:gid(),channelId:document.getElementById("chn").value});say("joined "+j.channel);load();}catch(e){say("join failed: "+e.message);}},'
-  + 'leave:async function(){try{await api("/api/leave",{guildId:gid()});say("left");load();}catch(e){say(e.message);}},'
-  + 'play:async function(){var q=document.getElementById("q2").value;if(!q){say("type a song first");return;}try{var j=await api("/api/play",{guildId:gid(),query:q});say("queued: "+j.title);document.getElementById("q2").value="";refresh();}catch(e){say("play failed: "+e.message);}},'
-  + 'ctl:async function(a){try{var j=await api("/api/ctl",{guildId:gid(),action:a});say(a+": "+j.result);refresh();}catch(e){say(e.message);}},'
-  + 'toggle:async function(){var g=cur();var paused=g&&g.player==="paused";try{var j=await api("/api/ctl",{guildId:gid(),action:paused?"resume":"pause"});say(j.result);refresh();}catch(e){say(e.message);}},'
-  + 'loop:async function(){var g=cur();var nx=g&&g.loop==="off"?"track":(g&&g.loop==="track"?"queue":"off");try{await api("/api/loop",{guildId:gid(),mode:nx});refresh();}catch(e){say(e.message);}},'
-  + 'vol:async function(){try{var j=await api("/api/volume",{guildId:gid(),value:Number(document.getElementById("vol").value)});say("volume "+j.result);refresh();}catch(e){say(e.message);}},'
-  + 'seek:async function(ev){var g=cur();if(!g||!g.nowPlaying||!g.nowPlaying.durationSec){say("live stream — cannot seek");return;}var r=document.getElementById("bar").getBoundingClientRect();var ratio=(ev.clientX-r.left)/r.width;ratio=Math.max(0,Math.min(1,ratio));var sec=Math.floor(ratio*g.nowPlaying.durationSec);try{await api("/api/seek",{guildId:gid(),seconds:sec});say("seek → "+fmt(sec));refresh();}catch(e){say(e.message);}}'
-  + '};'
-  + 'async function refresh(){var id=gid();if(!id)return;try{var gs=await(await fetch("/api/guilds")).json();PG.g=gs;var g=cur();if(!g)return;PG.snap=g;PG.snapAt=Date.now();paint();}catch(e){}}'
-  + 'function paint(){var g=PG.snap;if(!g)return;var np=g.nowPlaying;document.getElementById("ttl").textContent=np?np.title:"— idle —";document.getElementById("by").textContent=np?("by "+np.by):"";var cv=document.getElementById("cover");if(np&&np.thumb){cv.style.display="block";if(cv.src!==np.thumb)cv.src=np.thumb;}else{cv.style.display="none";cv.removeAttribute("src");}'
-  + 'var lc=document.getElementById("lyrics-container");if(np&&np.lyrics&&np.lyrics.synced&&np.lyrics.synced.length){lc.style.display="block";if(lc.dataset.title!==np.title){lc.innerHTML="";lc.dataset.title=np.title;np.lyrics.synced.forEach(function(l){var p=document.createElement("p");p.style.transition="all 0.3s";p.dataset.time=l.t;p.textContent=l.text||"♪";lc.appendChild(p);});}var sp=np.speed||1;var base=np.posBase||0;var t0=np.startedAt||PG.snapAt;var el=base+Math.max(0,(Date.now()-t0)/1000)*sp;var lines=Array.from(lc.children);var aIdx=-1;for(var i=0;i<lines.length;i++){if(parseFloat(lines[i].dataset.time)<=el)aIdx=i;else break;}lines.forEach(function(p,i){if(i===aIdx){if(p.dataset.active!=="1"){p.dataset.active="1";p.style.color="#fcd34d";p.style.transform="scale(1.1)";p.style.fontWeight="bold";lc.scrollTop=p.offsetTop-lc.offsetTop-(lc.clientHeight/2)+(p.clientHeight/2);}}else{p.dataset.active="0";p.style.color="";p.style.transform="";p.style.fontWeight="";}});}else{lc.style.display="none";lc.dataset.title="";}'
-  + 'var dur=np&&np.durationSec?np.durationSec:null;var sp=(np&&np.speed)||1;var base=(np&&np.posBase)||0;var t0=(np&&np.startedAt)||PG.snapAt;var el=base+Math.max(0,(Date.now()-t0)/1000)*sp;'
-  + 'document.getElementById("tcur").textContent=fmt(el);document.getElementById("ttot").textContent=dur?fmt(dur):"• LIVE";'
-  + 'var pct=dur?Math.max(0,Math.min(100,el/dur*100)):0;document.getElementById("fill").style.width=pct+"%";document.getElementById("knob").style.left=pct+"%";'
-  + 'document.getElementById("pp").textContent=(g.player==="paused")?"▶️":"⏸️";'
-  + 'document.getElementById("loopb").textContent="🔁 "+g.loop;'
-  + 'var v=document.getElementById("vol");if(v&&document.activeElement!==v)v.value=g.volume;'
-  + 'var q=document.getElementById("q");q.innerHTML="";(g.queue||[]).forEach(function(x){var li=document.createElement("li");li.textContent=x.title;q.appendChild(li);});if(!(g.queue||[]).length){var li=document.createElement("li");li.textContent="— empty —";q.appendChild(li);}}'
-  + 'document.getElementById("srv").addEventListener("change",function(){chans();refresh();});'
-  + 'setInterval(refresh,5000);setInterval(paint,500);load();'
-  + '</scr' + 'ipt></body></html>';
+    + '<style>body{font-family:system-ui;background:#0b1020;color:#e2e8f0;margin:0;padding:20px}.wrap{max-width:720px;margin:0 auto}.top{display:flex;gap:8px;align-items:center;margin-bottom:12px;flex-wrap:wrap}a{color:#93c5fd}select,input[type=text]{padding:8px;border-radius:8px;border:1px solid #334155;background:#020617;color:#e2e8f0}.card{background:#141b31;border:1px solid #263154;padding:18px;border-radius:14px;margin:12px 0}.cover{width:100%;max-height:340px;object-fit:cover;border-radius:10px;background:#000;display:none}#ttl{font-size:20px;font-weight:800;margin:12px 0 2px}#by{color:#94a3b8;font-size:13px}#barwrap{margin:14px 0 4px;cursor:pointer}#bar{height:8px;background:#263154;border-radius:99px;position:relative}#fill{height:100%;width:0%;background:#5865F2;border-radius:99px}#knob{width:14px;height:14px;background:#fff;border-radius:99px;position:absolute;top:-3px;left:0%}#times{display:flex;justify-content:space-between;font-size:12px;color:#94a3b8}.row{display:flex;gap:8px;margin-top:12px;flex-wrap:wrap;align-items:center}button{padding:10px 16px;border:0;border-radius:10px;background:#5865F2;color:#fff;font-weight:700;cursor:pointer;font-size:15px}.ghost{background:#334155}.danger{background:#b91c1c}.vol{display:flex;gap:8px;align-items:center}input[type=range]{width:140px}#q{margin:8px 0 0;padding-left:20px;font-size:14px}#msg{color:#94a3b8;font-size:13px;min-height:18px;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}::-webkit-scrollbar{width:6px;height:6px}::-webkit-scrollbar-track{background:transparent}::-webkit-scrollbar-thumb{background:#334155;border-radius:3px}</style></head><body><div class="wrap">'
+    + '<div class="top"><a href="/dashboard">← Dashboard</a><select id="srv"></select><select id="chn"></select><button class="ghost" onclick="P.join()">Join</button><button class="ghost" onclick="P.leave()">Leave</button></div>'
+    + '<div class="card"><img id="cover" class="cover" alt=""><div id="ttl">— idle —</div><div id="by"></div>'
+    + '<div id="lyrics-container" style="display:none; height:220px; overflow-y:auto; scroll-behavior:smooth; margin:16px 0; padding:12px; background:#020617; border-radius:8px; border:1px solid #334155; text-align:center; color:#94a3b8; font-size:15px; line-height:1.8; -webkit-mask-image: linear-gradient(transparent, black 15%, black 85%, transparent); mask-image: linear-gradient(transparent, black 15%, black 85%, transparent);"></div>'
+    + '<div id="barwrap" onclick="P.seek(event)"><div id="bar"><div id="fill"></div><div id="knob"></div></div></div>'
+    + '<div id="times"><span id="tcur">0:00</span><span id="ttot">• LIVE</span></div>'
+    + '<div class="row"><button onclick="P.ctl(\'prev\')">⏮</button><button id="pp" onclick="P.toggle()">▶</button><button onclick="P.ctl(\'skip\')">⏭</button><button class="danger" onclick="P.ctl(\'stop\')">⏹</button><button class="ghost" onclick="document.getElementById(\'q\').scrollIntoView({behavior:\'smooth\'})">📋</button><button class="ghost" id="loopb" onclick="P.loop()">🔁 off</button></div>'
+    + '<div class="row vol"><span>🔊</span><input id="vol" type="range" min="0" max="200" value="100"><button class="ghost" onclick="P.vol()">Set</button></div>'
+    + '<div class="row"><input id="q2" type="text" placeholder="song name or URL" style="flex:1;min-width:200px"><button onclick="P.play()">+ Queue</button></div>'
+    + '<div id="msg"></div></div>'
+    + '<div class="card"><h3 style="margin:0 0 8px">📋 Up next</h3><ol id="q"></ol></div>'
+    + '</div><script>'
+    + 'var PG={g:[],id:"",snap:null,snapAt:0};'
+    + 'function esc(s){return String(s==null?"":s).replace(/&/g,"&amp;").replace(/</g,"&lt;").replace(/>/g,"&gt;");}'
+    + 'function say(t){document.getElementById("msg").textContent=t;}'
+    + 'function gid(){var s=document.getElementById("srv");return s&&s.value?s.value:"";}'
+    + 'function fmt(s){if(s==null||!isFinite(s)||s<0)return"• LIVE";s=Math.floor(s);var m=Math.floor(s/60);s=s%60;return m+":"+(s<10?"0":"")+s;}'
+    + 'async function api(p,d){var r=await fetch(p,{method:d?"POST":"GET",headers:{"Content-Type":"application/json"},body:d?JSON.stringify(d):undefined});var j=null;try{j=await r.json();}catch(e){}if(!r.ok||(j&&j.error))throw new Error((j&&j.error)||("HTTP "+r.status));return j;}'
+    + 'async function load(){try{var g=await(await fetch("/api/guilds")).json();PG.g=g;var s=document.getElementById("srv");var keep=s.value;s.innerHTML="";g.forEach(function(x){var o=document.createElement("option");o.value=x.id;o.textContent=x.name;if(x.id===keep)o.selected=true;s.appendChild(o);});if(!s.value&&g.length)s.value=g[0].id;chans();refresh();}catch(e){say("load failed: "+e.message);}}'
+    + 'function cur(){var id=gid();for(var i=0;i<PG.g.length;i++)if(PG.g[i].id===id)return PG.g[i];return null;}'
+    + 'function chans(){var g=cur();var c=document.getElementById("chn");c.innerHTML="";if(!g)return;(g.voice||[]).forEach(function(x){var o=document.createElement("option");o.value=x.id;o.textContent=x.name+" ("+x.members+")";if(g.botVC===x.id)o.selected=true;c.appendChild(o);});}'
+    + 'var P={'
+    + 'join:async function(){try{var j=await api("/api/join",{guildId:gid(),channelId:document.getElementById("chn").value});say("joined "+j.channel);load();}catch(e){say("join failed: "+e.message);}},'
+    + 'leave:async function(){try{await api("/api/leave",{guildId:gid()});say("left");load();}catch(e){say(e.message);}},'
+    + 'play:async function(){var q=document.getElementById("q2").value;if(!q){say("type a song first");return;}try{var j=await api("/api/play",{guildId:gid(),query:q});say("queued: "+j.title);document.getElementById("q2").value="";refresh();}catch(e){say("play failed: "+e.message);}},'
+    + 'ctl:async function(a){try{var j=await api("/api/ctl",{guildId:gid(),action:a});say(a+": "+j.result);refresh();}catch(e){say(e.message);}},'
+    + 'toggle:async function(){var g=cur();var paused=g&&g.player==="paused";try{var j=await api("/api/ctl",{guildId:gid(),action:paused?"resume":"pause"});say(j.result);refresh();}catch(e){say(e.message);}},'
+    + 'loop:async function(){var g=cur();var nx=g&&g.loop==="off"?"track":(g&&g.loop==="track"?"queue":"off");try{await api("/api/loop",{guildId:gid(),mode:nx});refresh();}catch(e){say(e.message);}},'
+    + 'vol:async function(){try{var j=await api("/api/volume",{guildId:gid(),value:Number(document.getElementById("vol").value)});say("volume "+j.result);refresh();}catch(e){say(e.message);}},'
+    + 'seek:async function(ev){var g=cur();if(!g||!g.nowPlaying||!g.nowPlaying.durationSec){say("live stream — cannot seek");return;}var r=document.getElementById("bar").getBoundingClientRect();var ratio=(ev.clientX-r.left)/r.width;ratio=Math.max(0,Math.min(1,ratio));var sec=Math.floor(ratio*g.nowPlaying.durationSec);try{await api("/api/seek",{guildId:gid(),seconds:sec});say("seek → "+fmt(sec));refresh();}catch(e){say(e.message);}}'
+    + '};'
+    + 'async function refresh(){var id=gid();if(!id)return;try{var gs=await(await fetch("/api/guilds")).json();PG.g=gs;var g=cur();if(!g)return;PG.snap=g;PG.snapAt=Date.now();paint();}catch(e){}}'
+    + 'function paint(){var g=PG.snap;if(!g)return;var np=g.nowPlaying;document.getElementById("ttl").textContent=np?np.title:"— idle —";document.getElementById("by").textContent=np?("by "+np.by):"";var cv=document.getElementById("cover");if(np&&np.thumb){cv.style.display="block";if(cv.src!==np.thumb)cv.src=np.thumb;}else{cv.style.display="none";cv.removeAttribute("src");}'
+    + 'var lc=document.getElementById("lyrics-container");if(np&&np.lyrics&&np.lyrics.synced&&np.lyrics.synced.length){lc.style.display="block";if(lc.dataset.title!==np.title){lc.innerHTML="";lc.dataset.title=np.title;np.lyrics.synced.forEach(function(l){var p=document.createElement("p");p.style.transition="all 0.3s";p.dataset.time=l.t;p.textContent=l.text||"♪";lc.appendChild(p);});}var sp=np.speed||1;var base=np.posBase||0;var t0=np.startedAt||PG.snapAt;var el=base+Math.max(0,(Date.now()-t0)/1000)*sp;var lines=Array.from(lc.children);var aIdx=-1;for(var i=0;i<lines.length;i++){if(parseFloat(lines[i].dataset.time)<=el)aIdx=i;else break;}lines.forEach(function(p,i){if(i===aIdx){if(p.dataset.active!=="1"){p.dataset.active="1";p.style.color="#fcd34d";p.style.transform="scale(1.1)";p.style.fontWeight="bold";lc.scrollTop=p.offsetTop-lc.offsetTop-(lc.clientHeight/2)+(p.clientHeight/2);}}else{p.dataset.active="0";p.style.color="";p.style.transform="";p.style.fontWeight="";}});}else{lc.style.display="none";lc.dataset.title="";}'
+    + 'var dur=np&&np.durationSec?np.durationSec:null;var sp=(np&&np.speed)||1;var base=(np&&np.posBase)||0;var t0=(np&&np.startedAt)||PG.snapAt;var el=base+Math.max(0,(Date.now()-t0)/1000)*sp;'
+    + 'document.getElementById("tcur").textContent=fmt(el);document.getElementById("ttot").textContent=dur?fmt(dur):"• LIVE";'
+    + 'var pct=dur?Math.max(0,Math.min(100,el/dur*100)):0;document.getElementById("fill").style.width=pct+"%";document.getElementById("knob").style.left=pct+"%";'
+    + 'document.getElementById("pp").textContent=(g.player==="paused")?"▶️":"⏸️";'
+    + 'document.getElementById("loopb").textContent="🔁 "+g.loop;'
+    + 'var v=document.getElementById("vol");if(v&&document.activeElement!==v)v.value=g.volume;'
+    + 'var q=document.getElementById("q");q.innerHTML="";(g.queue||[]).forEach(function(x){var li=document.createElement("li");li.textContent=x.title;q.appendChild(li);});if(!(g.queue||[]).length){var li=document.createElement("li");li.textContent="— empty —";q.appendChild(li);}}'
+    + 'document.getElementById("srv").addEventListener("change",function(){chans();refresh();});'
+    + 'setInterval(refresh,5000);setInterval(paint,500);load();'
+    + '</scr' + 'ipt></body></html>';
 }
 function startDashboard() {
   const server = http.createServer(async (req, res) => {
     try {
       const url = new URL(req.url || "/", "http://localhost");
       const p = url.pathname;
-      if (p === "/health") { res.writeHead(200, { "Content-Type": "text/plain" }); res.end("Discord music bot is running"); return; }
+      if (req.method === "POST" && p !== "/login") {
+        const origin = req.headers.origin;
+        if (origin) {
+          try {
+            const u = new URL(origin);
+            if (u.host !== req.headers.host) {
+              res.writeHead(403, { "Content-Type": "application/json", "X-Content-Type-Options": "nosniff" });
+              res.end(JSON.stringify({ error: "cross-origin request forbidden" }));
+              return;
+            }
+          } catch {
+            res.writeHead(403, { "Content-Type": "application/json", "X-Content-Type-Options": "nosniff" });
+            res.end(JSON.stringify({ error: "invalid origin header" }));
+            return;
+          }
+        }
+      }
+      if (p === "/health") { res.writeHead(200, { "Content-Type": "text/plain", "X-Content-Type-Options": "nosniff" }); res.end("Discord music bot is running"); return; }
       if (p === "/") { res.writeHead(302, { Location: "/dashboard" }); res.end(); return; }
-      if (p === "/login" && req.method === "GET") { res.writeHead(200, { "Content-Type": "text/html; charset=utf-8" }); res.end(dashLoginPage()); return; }
+      if (p === "/login" && req.method === "GET") { res.writeHead(200, { "Content-Type": "text/html; charset=utf-8", "X-Content-Type-Options": "nosniff", "X-Frame-Options": "SAMEORIGIN" }); res.end(dashLoginPage()); return; }
       if (p === "/login" && req.method === "POST") {
         const ip = dashClientIp(req);
-        if (dashRateLimited(ip)) { res.writeHead(429, { "Content-Type": "text/html" }); res.end(dashLoginPage("Too many attempts, try again in 5 min")); return; }
+        if (dashRateLimited(ip)) { res.writeHead(429, { "Content-Type": "text/html", "X-Content-Type-Options": "nosniff" }); res.end(dashLoginPage("Too many attempts, try again in 5 min")); return; }
         const body = await dashBody(req, 64 * 1024);
         const f = dashParseForm(body);
-        if (!config.dashboardPassword) { dashNoteFail(ip); res.writeHead(200, { "Content-Type": "text/html" }); res.end(dashLoginPage("DASHBOARD_PASSWORD not set in .env — set it and restart")); return; }
-        if ((f.username || "") === config.dashboardUser && (f.password || "") === config.dashboardPassword) {
+        if (!config.dashboardPassword) { dashNoteFail(ip); res.writeHead(200, { "Content-Type": "text/html", "X-Content-Type-Options": "nosniff" }); res.end(dashLoginPage("DASHBOARD_PASSWORD not set in .env — set it and restart")); return; }
+        const userMatch = dashConstantTimeCompare(f.username || "", config.dashboardUser);
+        const passMatch = dashConstantTimeCompare(f.password || "", config.dashboardPassword);
+        if (userMatch && passMatch) {
           const t = dashCreateSession(config.dashboardUser);
-          res.writeHead(302, { Location: "/dashboard", "Set-Cookie": `dash_session=${t}; HttpOnly; Path=/; SameSite=Lax; Max-Age=${12 * 3600}` });
+          const isHttps = req.headers["x-forwarded-proto"] === "https" || req.socket?.encrypted;
+          res.writeHead(302, {
+            Location: "/dashboard",
+            "Set-Cookie": `dash_session=${t}; HttpOnly; Path=/; SameSite=Lax; Max-Age=${12 * 3600}${isHttps ? "; Secure" : ""}`,
+            "X-Content-Type-Options": "nosniff",
+            "X-Frame-Options": "SAMEORIGIN",
+          });
           res.end(); return;
         }
         dashNoteFail(ip);
         logPretty("WARN", "Dashboard login failed", { tail: ip });
-        res.writeHead(200, { "Content-Type": "text/html" }); res.end(dashLoginPage("Invalid username or password")); return;
+        res.writeHead(200, { "Content-Type": "text/html", "X-Content-Type-Options": "nosniff" }); res.end(dashLoginPage("Invalid username or password")); return;
       }
       if (p === "/logout") {
         const t = dashParseCookies(req).dash_session;
@@ -4260,8 +5065,11 @@ function startDashboard() {
   });
   server.on("error", (e) => {
     // Dashboard port blocked (EACCES/EADDRINUSE) must NOT kill the Discord bot.
-    logPretty("ERROR", `Dashboard port ${config.port} failed (${e?.code || e?.message}). Discord still running — set PORT=3100 in .env and restart for dashboard.`);
+    logPretty("ERROR", `Dashboard port ${config.port} failed (${e?.code || e?.message}). Discord still running — set PORT=4000 in .env and restart for dashboard.`);
   });
+  server.setTimeout(30000);
+  server.headersTimeout = 35000;
+  server.requestTimeout = 30000;
   server.listen(config.port, () => logPretty("SYSTEM", `Dashboard on port ${config.port} (/health, /login, /dashboard)`));
 }
 startDashboard();

@@ -4,3 +4,8 @@ npm-debug.log
 logs
 data
 .DS_Store
+.env
+*.env
+cookies.txt
+cokies.txt
+*.bak

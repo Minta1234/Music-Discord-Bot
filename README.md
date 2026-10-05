@@ -11,7 +11,8 @@ A feature-rich Discord music bot with live karaoke lyrics, AI chat, a web dashbo
 - 🎤 **Live synced karaoke lyrics** — scrolling highlighted in the Now Playing embed
 - ⚡ **Speed control** — toggle 1x / 2x seamlessly (no restart from beginning)
 - 🔊 **Volume control** (0–10000%)
-- 🤖 **AI chat** (Gemini / OpenRouter) with custom persona support
+- 🛡️ **Stable Audio** — Native C++ Opus encoding (libsodium & @discordjs/opus) for zero-lag playback
+- 🤖 **AI chat** (Gemini 1.5 Flash / OpenRouter) with custom persona support
 - 🌐 **Web dashboard** at `localhost:4000` — full playback control in browser
 - 📺 **Watch Together** — Discord Watch Party link
 - 🎛️ **Discord button controls** — Prev, Play/Pause, Skip, Stop, List, Loop, Speed, Lyrics, Volume
@@ -190,8 +191,6 @@ All commands are Discord slash commands — the legacy `n!` prefix was removed:
 - Dashboard protected with login + rate limiting
 - Bot responses that only you should see are **ephemeral** (private)
 
-
-by the default Script :https://github.com/Minta1234/Music-Discord-Bot/blob/a8ba26aa92d3d446868becec777962023f95f528/defaultbot.js
 ---
 Refference:
 https://github.com/ninjamadeena/music-discord-bot
