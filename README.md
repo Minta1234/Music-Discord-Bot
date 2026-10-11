@@ -1,43 +1,45 @@
 # 🎵 bocchi — Discord Music Bot
 
-A feature-rich Discord music bot with live karaoke lyrics, AI chat, a web dashboard, YouTube/TikTok/Spotify support, and real-time playback controls.
+A feature-rich Discord music bot with high-performance NodeLink streaming, live karaoke lyrics, AI chat, a web dashboard, YouTube/TikTok/SoundCloud/Spotify support, and interactive playback controls.
 
 ---
 
 ## ✨ Features
 
-- 🎶 **YouTube, TikTok & Spotify** support (Spotify → YouTube search)
-- 📋 **Queue system** with shuffle, remove, loop modes
-- 🎤 **Live synced karaoke lyrics** — scrolling highlighted in the Now Playing embed
-- ⚡ **Speed control** — toggle 1x / 2x seamlessly (no restart from beginning)
-- 🔊 **Volume control** (0–10000%)
-- 🛡️ **Stable Audio** — Native C++ Opus encoding (libsodium & @discordjs/opus) for zero-lag playback
-- 🤖 **AI chat** (Gemini 1.5 Flash / OpenRouter) with custom persona support
-- 🌐 **Web dashboard** at `localhost:4000` — full playback control in browser
-- 📺 **Watch Together** — Discord Watch Party link
-- 🎛️ **Discord button controls** — Prev, Play/Pause, Skip, Stop, List, Loop, Speed, Lyrics, Volume
-- 🔒 **Private-only replies** — bot responses are ephemeral (only you see them)
-- 🎵 **End-of-playlist chime** — plays a jingle when the queue ends
-- 🏠 **#bocchi control room** — dedicated text channel for all bot output
+- ⚡ **Ultra-Fast Audio Engine** — Powered by [NodeLink](https://github.com/PerformanC/NodeLink) for sub-second playback start and high audio fidelity.
+- 🎶 **Multi-Platform Support** — Direct audio streaming from YouTube, Spotify, SoundCloud, and TikTok.
+- 📋 **Queue System** — Interactive queue with shuffle, remove, and multi-mode looping (Off / Track / Queue).
+- 🎤 **Live Synced Karaoke Lyrics** — Scrolling real-time synchronized lyrics right inside the Now Playing embed.
+- 🔊 **Volume Control** — Smooth volume adjustment (0–10000%).
+- 🛡️ **Stable Audio Pipeline** — Native C++ Opus encoding (libsodium & @discordjs/opus) for zero-lag and crystal clear audio.
+- 🤖 **AI Chat** — Gemini 1.5 Flash / OpenRouter AI integration with customizable persona channels and private threads.
+- 🌐 **Web Dashboard** — Web control interface at `http://localhost:4000` with visual player, queue management, and live lyrics.
+- 🎛️ **Discord Interactive Control Panel** — Quick controls directly on the panel with expandable secondary controls via the **More** button.
+- 🔒 **Private & Ephemeral Feedback** — Notifications and status checks only visible to the user triggering them.
+- 🏠 **Dedicated #bocchi Room** — All playback controls and bot interactions organized neatly in one room.
 
 ---
 
-## 🚀 Setup
+## 🚀 Setup & Installation
 
 ### 1. Prerequisites
 
 - [Node.js](https://nodejs.org/) v22+
-- [ffmpeg](https://ffmpeg.org/) installed and on PATH
-- [yt-dlp](https://github.com/yt-dlp/yt-dlp) (auto-updated by the bot)
+- [ffmpeg](https://ffmpeg.org/) installed and available in system PATH
+- [yt-dlp](https://github.com/yt-dlp/yt-dlp) (used as fallback stream resolver)
 - A [Discord Bot Token](https://discord.com/developers/applications)
 
-### 2. Install
+### 2. Clone with Submodules
+
+Clone the repository along with the [NodeLink](https://github.com/PerformanC/NodeLink) submodule:
 
 ```bash
-git clone https://github.com/Minta1234/Music-Discord-Bot.git
+git clone --recursive https://github.com/Minta1234/Music-Discord-Bot.git
 cd Music-Discord-Bot
 npm install
 ```
+
+*(If you already cloned without `--recursive`, run: `git submodule update --init --recursive`)*
 
 ### 3. Configure `.env`
 
@@ -55,14 +57,22 @@ DEFAULT_VOLUME=100
 DEFAULT_LOOP_MODE=off
 DISCONNECT_DELAY_SEC=300
 TIMEZONE_OFFSET_HOURS=7
+
+# NodeLink Engine (Optional / Default: enabled on localhost:2333)
+NODELINK_ENABLED=true
+NODELINK_HOST=127.0.0.1
+NODELINK_PORT=2333
+NODELINK_PASSWORD=youshallnotpass
 ```
 
-### 4. Run
+### 4. Run the Bot
 
 ```bash
+# Windows quick start (starts NodeLink & Bot together)
+start.bat
+
+# Or run manually:
 node bot.js
-# or
-./start.bat   # Windows
 ```
 
 ---
@@ -73,92 +83,86 @@ node bot.js
 
 | Command | Description |
 |---------|-------------|
-| `/play query:<song>` | Play a song from YouTube (name or URL) |
-| `/playlist query:<url>` | Add a full YouTube playlist or bulk search |
+| `/play query:<song>` | Play a song from YouTube, Spotify, SoundCloud, or TikTok |
+| `/playlist query:<url>` | Add a full playlist or album to queue |
+| `/batchplay` | Open modal to paste and enqueue multiple song URLs/titles |
 | `/skip` | Skip the current song |
-| `/stop` | Stop playback and clear queue |
+| `/stop` | Stop playback and clear the queue |
 | `/pause` | Pause playback |
 | `/resume` | Resume playback |
-| `/np` | Show what's playing now (with lyrics) |
-| `/queue` / `/list` | Show the queue (only visible to you) |
-| `/remove index:<n>` | Remove a song by its queue position |
-| `/shuffle` | Shuffle the queue randomly |
-| `/loop mode:<off/track/queue>` | Set loop mode |
-| `/volume value:<0-10000>` | Set volume percentage |
+| `/np` | Show what's playing now with synced lyrics |
+| `/queue` / `/list` | Show current queue list |
+| `/remove index:<n>` | Remove a song by position in queue |
+| `/shuffle` | Shuffle songs in queue |
+| `/loop mode:<off/track/queue>` | Set repeat mode |
+| `/volume value:<0-10000>` | Adjust volume percentage |
 
 ### 🎛️ Control Panel
 
 | Command | Description |
 |---------|-------------|
-| `/panel` | Post the music control panel with buttons |
-| `/setup` | Create the `#bocchi` control room (Admin only) |
+| `/panel` | Send the living music control panel to the control channel |
+| `/setup` | Automatically set up `#bocchi` text and voice channels (Admin only) |
 
 ### 🤖 AI Chat
 
 | Command | Description |
 |---------|-------------|
-| `/ai question:<text>` | Ask the AI a question |
-| `/airef persona:<text>` | Set a custom AI persona for this channel |
-| `/setai` | Create a public AI chat channel |
+| `/ai question:<text>` | Chat directly with AI |
+| `/airef persona:<text>` | Configure persona prompt for this channel |
+| `/setai` | Create a dedicated public AI chat channel |
 | `/setaip` | Open a private temporary AI chat thread |
-| `/delete` | Delete your private AI chat thread |
-| `/deletep confirm:true` | Delete all messages in the public AI chat |
-| `/clear` | Clear all AI history on this server(#bocchi) |
+| `/delete` | Close and delete your private AI chat thread |
+| `/deletep confirm:true` | Clear messages in public AI channel |
+| `/clear` | Clear AI conversation history |
 
 ### 🛠️ Utility
 
 | Command | Description |
 |---------|-------------|
-| `/ping` | Check bot latency |
-| `/botupdate` | Update yt-dlp to latest version |
-| `/ytstatus` | Check YouTube cookie sign-in status |
-| `/ytsignin file:<cookies.txt>` | Sign in with YouTube cookies (Admin) |
+| `/ping` | Check bot latency and heartbeat |
+| `/botupdate` | Check for and update yt-dlp binary |
+| `/ytstatus` | Check YouTube cookie status |
+| `/ytsignin file:<cookies.txt>` | Upload and activate YouTube cookies (Admin) |
 | `/ytsignout` | Remove YouTube cookies (Admin) |
-| `/video query:<url>` | Share video page + play audio |
-| `/watchtogether` | Start a Discord Watch Together session |
-| `/vstate` | Debug voice/player status (Admin) |
-| `/help` | Show all commands |
+| `/video query:<url>` | Share video link + stream audio |
+| `/watchtogether` | Start a Discord Watch Together party link |
+| `/vstate` | Debug voice and player diagnostic state |
+| `/help` | Display command list and guide |
 
 ---
 
-## 🕹️ Button Controls
+## 🕹️ Interactive Button Controls
 
-When the Now Playing panel is active, you get one-click buttons:
+When the control panel is posted in `#bocchi`, you can control everything using Discord buttons:
 
+### Main Controls (Row 1)
 | Button | Action |
 |--------|--------|
-| ⏮ Prev | Play previous track |
-| ▶/⏸ Play/Pause | Toggle playback |
-| ⏭ Skip | Skip to next song |
-| ⏹ Stop | Stop + clear queue |
-| 📋 List | Show queue (private) |
-| 🔁 Loop | Cycle loop modes |
-| ⏩ Speed | Toggle 1x / 2x speed |
-| 📝 Lyrics | Toggle karaoke lyrics |
-| 🔊 Vol+ / 🔉 Vol− | Adjust volume |
-| 🎛 Controls | Show/hide settings row |
+| `⏮ Prev` | Jump back to the previous track in history |
+| `▶/⏸ Play/Pause` | Instant toggle play and pause |
+| `⏭ Next` | Skip to next song |
+| `More` | Toggle secondary controls on/off (expands/collapses Row 2) |
+
+### Secondary Controls (Row 2 — Toggled by More)
+| Button | Action |
+|--------|--------|
+| `⏹ Stop` | Stop audio playback and clear the queue |
+| `📋 Queue` | View current queue list |
+| `🔁 Loop: Off/Track/Queue` | Cycle repeat mode |
+| `📝 Lyrics: On/Off` | Toggle karaoke lyrics display |
+| `⭐ Favorite` | Save track to favorites |
 
 ---
 
 ## 🌐 Web Dashboard
 
-Access the dashboard at `http://localhost:4000`
+Access the dashboard at `http://localhost:4000`:
 
-- Login with `DASHBOARD_USER` / `DASHBOARD_PASSWORD` from `.env`
-- Full playback control, queue view, volume slider
-- Scrolling live karaoke lyrics synced to playback
-
----
-
-## 🐳 Docker / Nixpacks
-
-The project includes `Dockerfile` and `nixpacks.toml` for easy deployment on platforms like [Railway](https://railway.app/).
-
-```toml
-# nixpacks.toml
-[phases.setup]
-aptPkgs = ["ffmpeg", "python3", "ca-certificates", "tzdata"]
-```
+- Sign in with `DASHBOARD_USER` / `DASHBOARD_PASSWORD` configured in `.env`
+- Real-time player status, track scrubbing, and volume control
+- Live synchronized karaoke lyrics
+- YouTube cookies management directly from web UI
 
 ---
 
@@ -166,31 +170,21 @@ aptPkgs = ["ffmpeg", "python3", "ca-certificates", "tzdata"]
 
 ```
 .
-├── bot.js              # Main bot logic
+├── bot.js              # Main Discord bot application
+├── nodelink/           # NodeLink audio engine (Git Submodule)
+├── .gitmodules         # Submodule mapping for NodeLink
 ├── package.json
-├── nixpacks.toml       # Railway/Nixpacks config
+├── nixpacks.toml       # Railway / Nixpacks deployment configuration
 ├── Dockerfile
-├── Assets/             # End-of-playlist audio chime
-├── .env                # Environment variables (not committed)
-└── cookies.txt         # YouTube cookies (not committed)
+├── Assets/             # Audio assets and chimes
+├── .env                # Configuration and API keys (gitignored)
+└── cookies.txt         # YouTube cookies file (gitignored)
 ```
-
----
-
-## 💬 Commands (slash only)
-
-All commands are Discord slash commands — the legacy `n!` prefix was removed:
-
-`/play`, `/skip`, `/stop`, `/pause`, `/resume`, `/np`, `/queue`, `/volume`, `/loop`, `/shuffle`, `/remove`, `/playlist`, `/help`, `/panel`, `/setup`, `/video`, `/watchtogether`, `/vstate`, `/ytsignin`, `/ytsignout`, `/ytstatus`
 
 ---
 
 ## 🔐 Privacy & Security
 
-- `.env` and `cookies.txt` are **never committed** (in `.gitignore`)
-- Dashboard protected with login + rate limiting
-- Bot responses that only you should see are **ephemeral** (private)
-
----
-Refference:
-https://github.com/ninjamadeena/music-discord-bot
+- Sensitive credentials (`.env` and `cookies.txt`) are excluded from Git via `.gitignore`.
+- Dashboard is secured with HTTP basic authentication and rate limiting.
+- Interaction replies and diagnostic outputs are ephemeral to prevent channel spam.
