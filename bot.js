@@ -855,7 +855,7 @@ function buildControlRows(state = null) {
     new ButtonBuilder().setCustomId("mus_prev").setLabel("Prev").setEmoji("⏮").setStyle(ButtonStyle.Secondary),
     new ButtonBuilder().setCustomId("mus_resume").setLabel(paused ? "Play" : "Pause").setEmoji(paused ? "▶" : "⏸").setStyle(paused ? ButtonStyle.Success : ButtonStyle.Primary),
     new ButtonBuilder().setCustomId("mus_skip").setLabel("Next").setEmoji("⏭").setStyle(ButtonStyle.Secondary),
-    new ButtonBuilder().setCustomId("mus_controls").setLabel("More").setEmoji("⋯").setStyle(shown ? ButtonStyle.Primary : ButtonStyle.Secondary),
+    new ButtonBuilder().setCustomId("mus_controls").setLabel("More").setStyle(shown ? ButtonStyle.Primary : ButtonStyle.Secondary),
   );
   rows.push(r1);
 
@@ -938,6 +938,9 @@ async function handleMusicButton(itx) {
   const id = itx.customId;
   const guild = itx.guild;
   const state = getGuildState(guild);
+  if (itx.message?.id && itx.channelId) {
+    state.npMessage = { channelId: itx.channelId, messageId: itx.message.id };
+  }
   const me = guild.members.me;
   const userVC = itx.member?.voice?.channelId;
   const botVC = me?.voice?.channelId;
@@ -971,10 +974,17 @@ async function handleMusicButton(itx) {
       // Single Play button toggles: reclick pauses, reclick again resumes.
       if (state.player.state.status === AudioPlayerStatus.Paused) {
         state.player.unpause();
-        return itx.reply({ content: `▶ Playing: **${cleanTitle(state.current?.title || "—")}**`, flags: MessageFlags.Ephemeral });
+      } else {
+        state.player.pause();
       }
-      state.player.pause();
-      return itx.reply({ content: "⏸ Paused — press ▶ to resume", flags: MessageFlags.Ephemeral });
+      const embed = buildNowPlayingEmbed(state, state.currentLyrics);
+      const components = buildControlRows(state);
+      try {
+        return await itx.update({ embeds: [embed], components });
+      } catch {
+        await refreshNpControls(guild, state);
+        return itx.deferUpdate().catch(() => { });
+      }
     } catch { return itx.reply({ content: "⏸ Paused", flags: MessageFlags.Ephemeral }); }
   }
   if (id === "mus_skip") { state.skipRequested = true; try { state.player.stop(true); } catch { } cleanupCurrentPipeline(state); return itx.reply({ content: "⏭ Skipped", flags: MessageFlags.Ephemeral }); }
@@ -997,14 +1007,26 @@ async function handleMusicButton(itx) {
   }
   if (id === "mus_loop") {
     state.loopMode = state.loopMode === "off" ? "track" : state.loopMode === "track" ? "queue" : "off";
-    await refreshNpControls(guild, state);
-    return itx.reply({ content: `🔁 Loop: **${loopLabel(state.loopMode)}**`, flags: MessageFlags.Ephemeral });
+    const embed = state.current ? buildNowPlayingEmbed(state, state.currentLyrics) : buildPanelEmbed(guild);
+    const components = buildControlRows(state);
+    try {
+      return await itx.update({ embeds: [embed], components });
+    } catch {
+      await refreshNpControls(guild, state);
+      return itx.deferUpdate().catch(() => { });
+    }
   }
   if (id === "mus_controls") {
     state.showControls = !(state.showControls !== false);
     try { if (state.guildId) setSavedShowControls(state.guildId, state.showControls); } catch { }
-    await refreshNpControls(guild, state);
-    return itx.reply({ content: state.showControls ? "🎛 Controls Show" : "🎛 Controls hidden — the settings row stays so you can bring them back", flags: MessageFlags.Ephemeral });
+    const embed = state.current ? buildNowPlayingEmbed(state, state.currentLyrics) : buildPanelEmbed(guild);
+    const components = buildControlRows(state);
+    try {
+      return await itx.update({ embeds: [embed], components });
+    } catch {
+      await refreshNpControls(guild, state);
+      return itx.deferUpdate().catch(() => { });
+    }
   }
   if (id === "mus_setup") {
     if (!isGuildAdmin(itx.member)) return itx.reply({ content: "Manage Server permission required.", flags: MessageFlags.Ephemeral });
@@ -1017,8 +1039,14 @@ async function handleMusicButton(itx) {
   if (id === "mus_lyrics") {
     state.showLyrics = !(state.showLyrics !== false);
     try { if (state.guildId) setSavedShowLyrics(state.guildId, state.showLyrics); } catch { }
-    await refreshNpControls(guild, state);
-    return itx.reply({ content: state.showLyrics ? "📝 Karaoke lyrics on — sing along!" : "📝 Lyrics hidden", flags: MessageFlags.Ephemeral });
+    const embed = state.current ? buildNowPlayingEmbed(state, state.currentLyrics) : buildPanelEmbed(guild);
+    const components = buildControlRows(state);
+    try {
+      return await itx.update({ embeds: [embed], components });
+    } catch {
+      await refreshNpControls(guild, state);
+      return itx.deferUpdate().catch(() => { });
+    }
   }
   if (id === "mus_volup") { setVolumePct(state, (state.volumePct || 100) + 20); return itx.reply({ content: `🔊 ${state.volumePct}%`, flags: MessageFlags.Ephemeral }); }
   if (id === "mus_voldown") { setVolumePct(state, Math.max(0, (state.volumePct || 100) - 20)); return itx.reply({ content: `🔉 ${state.volumePct}%`, flags: MessageFlags.Ephemeral }); }
@@ -1051,7 +1079,6 @@ function buildHelpEmbedSlash() {
         value: [
           "`/play query:<name/URL>` — Play or queue a song",
           "`/stm [file:<upload>] [name:<Assets file>]` — Stream audio from file",
-          "`/live url:<stream URL/search>` — Stream live audio (YouTube Live, radio)",
           "`/batchplay` — Open a form to add multiple songs at once",
           "`/playlist query:<URL/search> limit:<N>` — Load songs in bulk",
           "`/queue` — Show the full queue",
@@ -1606,7 +1633,9 @@ async function upsertNpMessage(guild, channelId, embed, withControls = true) {
     const ref = { channelId: ch.id, messageId: msg.id };
     st.npMessage = ref;
     return ref;
-  } catch { }
+  } catch (err) {
+    logPretty("ERROR", `upsertNpMessage failed in ${ch?.name}: ` + (err?.message || err));
+  }
   return null;
 }
 
@@ -1678,7 +1707,7 @@ async function handleAiChatMessage(msg) {
 // commands run against the shared server; dangerous/admin commands are
 // filtered out; plain text gets a conversational reply.
 const DM_BLOCKED_COMMANDS = new Set(["ytsignin", "ytsignout", "botupdate", "setup", "setai", "setaip", "delete", "deletep", "clear", "airef", "vstate", "watchtogether", "video"]);
-const DM_MUSIC_COMMANDS = new Set(["play", "playlist", "skip", "stop", "pause", "resume", "queue", "np", "remove", "shuffle", "loop", "volume", "panel", "live"]);
+const DM_MUSIC_COMMANDS = new Set(["play", "playlist", "skip", "stop", "pause", "resume", "queue", "np", "remove", "shuffle", "loop", "volume", "panel"]);
 const DM_COMMAND_ALIASES = { p: "play", q: "queue", now: "np", next: "skip", s: "skip", st: "stop", vol: "volume", upd: "botupdate", h: "help", controls: "panel" };
 async function dmTargetGuild(userId) {
   let mutual = null;
@@ -1773,30 +1802,6 @@ async function runDmMusicCommand(msg, guild, cmd, parts) {
     });
     if (!state.current) playNext(guild, textChannelId, state);
     return;
-  }
-  if (cmd === "live") {
-    const raw = parts.join(" ").trim();
-    if (!raw) return reply({ embeds: [errorEmbed("Give me a live stream URL or search query\n**Example:** `live https://www.youtube.com/watch?v=...`")] });
-    const cleanUrl = sanitizeSearchQuery(raw);
-    const item = {
-      title: cleanUrl,
-      source: cleanUrl,
-      isLive: true,
-      durationSec: null,
-      requestedBy: msg.author.tag,
-      guild,
-      voiceChannelId: userVC,
-      textChannelId,
-    };
-    state.queue.push(item);
-    const shouldStart = !state.current;
-    if (shouldStart) playNext(guild, textChannelId, state);
-    resolveTitleAndThumb(cleanUrl).then(meta => {
-      if (meta.title && meta.title !== cleanUrl) item.title = meta.title;
-      if (meta.thumb) item.thumb = meta.thumb;
-      item.durationSec = null;
-    }).catch(() => { });
-    return reply({ embeds: [successEmbed("🔴 Live Stream Queued", `**${cleanUrl}**`)] });
   }
   if (cmd === "skip") {
     if (!state.current) return reply({ embeds: [infoEmbed(" Nothing playing", "Nothing to skip")] });
@@ -2403,7 +2408,7 @@ function setCachedMeta(key, data) {
 async function fetchNodeLinkTracks(identifier) {
   if (!config.nodelinkEnabled) return null;
   const ctrl = new AbortController();
-  const timer = setTimeout(() => ctrl.abort(), 2500);
+  const timer = setTimeout(() => ctrl.abort(), 5000);
   try {
     const enc = encodeURIComponent(identifier);
     const res = await fetch(`http://${config.nodelinkHost}:${config.nodelinkPort}/v4/loadtracks?identifier=${enc}`, {
@@ -2924,45 +2929,6 @@ function spawnNodeLinkStreamPipe(encodedTrack, offsetSec) {
     httpReq,
     raw: ff.stdout,
   };
-}
-
-// ffmpeg with direct URL input (e.g. for M3U8 live streams).
-function ffmpegUrlArgs(url, offsetSec, isLive = false) {
-  const a = ["-loglevel", "info", "-hide_banner"];
-  if (isLive) {
-    a.push("-reconnect", "1", "-reconnect_streamed", "1", "-reconnect_delay_max", "5");
-  }
-  a.push("-user_agent", "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/126.0.0.0 Safari/537.36");
-  const off = Number(offsetSec);
-  if (Number.isFinite(off) && off > 0) a.push("-ss", String(off));
-  a.push("-i", url, "-vn");
-  a.push("-ac", String(config.audioChannels), "-ar", String(config.audioSampleRate));
-  const afChain = (config.audioFilter || "").trim();
-  if (afChain) a.push("-af", afChain);
-  a.push("-c:a", "libopus", "-b:a", config.opusBitrate);
-  if (config.opusVbr === "off") a.push("-vbr", "off");
-  else if (config.opusVbr === "constrained") a.push("-vbr", "constrained");
-  else a.push("-vbr", "on");
-  if (["audio", "voip", "lowdelay"].includes(config.opusApplication))
-    a.push("-application", config.opusApplication);
-  const fd = Number(config.opusFrameDuration);
-  if ([2.5, 5, 10, 20, 40, 60].includes(fd)) a.push("-frame_duration", String(fd));
-  const cx = Number(config.opusComplexity);
-  if (Number.isFinite(cx) && cx >= 0 && cx <= 10) a.push("-compression_level", String(cx));
-  if (config.ffmpegExtraArgs && config.ffmpegExtraArgs.trim())
-    a.push(...config.ffmpegExtraArgs.trim().split(/\s+/));
-  a.push("-f", "ogg", "pipe:1");
-  return a;
-}
-
-function spawnFfmpegUrlPipe(url, offsetSec, isLive = false) {
-  if (!FFMPEG_AVAILABLE) throw new Error("ffmpeg binary not available");
-  const ff = spawn(FFMPEG || "ffmpeg", ffmpegUrlArgs(url, offsetSec, isLive), { stdio: ["ignore", "pipe", "pipe"] });
-  ff.on("error", (e) => logPretty("ERROR", `ffmpeg(url) error: ` + (e?.message || e)));
-  ff.stdout.on("error", swallowPipeError);
-  ff.stderr.on("error", swallowPipeError);
-  ff.stderr.on("data", (d) => { try { logPretty("LOG", `[ffmpeg(url)] ` + d.toString().trim()); } catch { } });
-  return { ff, stream: cushionStream(ff), helper: null, raw: ff.stdout };
 }
 
 // ffmpeg with local audio file input. Directly reads file with native seek support.
@@ -3622,6 +3588,46 @@ async function startPlayback(guild, item, state, stayPut = false) {
     return { pageUrl: null };
   }
 
+  if (isSpotifyUrl(item.source)) {
+    const kind = spotifyKind(item.source);
+    if (kind === "album" || kind === "playlist") throw new Error("Spotify albums/playlists not supported in play; use /playlist");
+  }
+
+  // NodeLink FIRST for every link (YouTube / SoundCloud / TikTok / Spotify) and
+  // searches: ~1s to audio, no yt-dlp process. Old paths below are fallbacks.
+  if (config.nodelinkEnabled) {
+    let enc = item.encodedTrack || getCachedMeta(item.source)?.encodedTrack;
+    if (!enc) {
+      try {
+        const raw = String(item.source || "").trim();
+        const nlIdent = isUrl(raw) ? raw : `ytsearch:${sanitizeSearchQuery(raw.replace(/^ytsearch\d*:/i, ""))}`;
+        const nlRes = await fetchNodeLinkTracks(nlIdent);
+        const firstItem = nlRes?.data?.[0] || (Array.isArray(nlRes?.data) ? null : (nlRes?.data?.tracks?.[0] || nlRes?.data));
+        if (firstItem?.encoded) {
+          enc = firstItem.encoded;
+          item.encodedTrack = enc;
+          if (firstItem.info?.title && (item.title === item.source || isUrl(item.title))) item.title = firstItem.info.title;
+          if (!item.thumb && firstItem.info?.artworkUrl) item.thumb = firstItem.info.artworkUrl;
+          if (!item.durationSec && firstItem.info?.length && !firstItem.info?.isStream) item.durationSec = Math.round(firstItem.info.length / 1000);
+        }
+      } catch { }
+    }
+    if (enc) {
+      const savedOffset = item.offsetSec;
+      try {
+        logPretty("LOG", `[nodelink] streaming via NodeLink: ${item.title}`);
+        const pipeObj = spawnNodeLinkStreamPipe(enc, consumeOffset(item, state));
+        await playPipe(guild, item, state, pipeObj);
+        return { pageUrl: item.videoUrl || item.source };
+      } catch (nlErr) {
+        logPretty("WARN", `[nodelink] playback failed (${nlErr?.message || nlErr}), falling back`);
+        cleanupCurrentPipeline(state);
+        item.offsetSec = savedOffset;
+        item.encodedTrack = null;
+      }
+    }
+  }
+
   // Resolve source: convert Spotify track → search query if needed.
   // For everything else (YouTube URL, search text, SoundCloud URL etc.)
   // we pass it straight to yt-dlp which handles search internally.
@@ -3635,16 +3641,6 @@ async function startPlayback(guild, item, state, stayPut = false) {
   } else if (!isUrl(source)) {
     // Plain text search query — prefix with ytsearch so yt-dlp searches YouTube
     source = `ytsearch1:${sanitizeSearchQuery(source)}`;
-  }
-
-  // Live stream handling
-  if (item.isLive) {
-    const pc = item.altClient || config.ytdlpPlayerClient;
-    const info = await ytdlp(source, ytdlpOpts({ dumpSingleJson: true, skipDownload: true, extractorArgs: `youtube:player-client=${pc};player_skip=webpage` }));
-    const e = info?.entries?.[0] || info;
-    if (!e || !e.url) throw new Error("Could not extract live stream URL");
-    await playPipe(guild, item, state, spawnFfmpegUrlPipe(e.url, 0, true));
-    return { pageUrl: source };
   }
 
   // TikTok: metadata via TikWM. Audio is streamed via Cloudflare Worker proxy
@@ -3693,38 +3689,6 @@ async function startPlayback(guild, item, state, stayPut = false) {
       return { pageUrl: source };
     } catch (e) {
       logPretty("WARN", `[tikwm] failed (${e?.message || e}), falling back to direct yt-dlp`);
-    }
-  }
-
-  // NodeLink ultra-fast stream (sub-100ms instant audio, zero yt-dlp latency)
-  if (config.nodelinkEnabled && !item.isLive) {
-    let enc = item.encodedTrack || getCachedMeta(source)?.encodedTrack || getCachedMeta(item.title)?.encodedTrack;
-    if (!enc) {
-      try {
-        // Use the ORIGINAL input: NodeLink resolves Spotify/SoundCloud/TikTok
-        // URLs natively; `source` may already carry yt-dlp's "ytsearch1:" prefix.
-        const raw = String(item.source || "").trim();
-        const nlIdent = isUrl(raw) ? raw : `ytsearch:${sanitizeSearchQuery(raw.replace(/^ytsearch\d*:/i, ""))}`;
-        const nlRes = await fetchNodeLinkTracks(nlIdent);
-        const firstItem = nlRes?.data?.[0] || (Array.isArray(nlRes?.data) ? null : nlRes?.data);
-        if (firstItem?.encoded) {
-          enc = firstItem.encoded;
-          item.encodedTrack = enc;
-          if (firstItem.info?.title && (item.title === item.source || isUrl(item.title))) item.title = firstItem.info.title;
-          if (!item.thumb && firstItem.info?.artworkUrl) item.thumb = firstItem.info.artworkUrl;
-          if (!item.durationSec && firstItem.info?.length) item.durationSec = Math.round(firstItem.info.length / 1000);
-        }
-      } catch { }
-    }
-    if (enc) {
-      try {
-        logPretty("LOG", `[nodelink] streaming track via NodeLink: ${item.title}`);
-        const pipeObj = spawnNodeLinkStreamPipe(enc, consumeOffset(item, state));
-        await playPipe(guild, item, state, pipeObj);
-        return { pageUrl: item.videoUrl || source };
-      } catch (nlErr) {
-        logPretty("WARN", `[nodelink] playback failed (${nlErr?.message || nlErr}), falling back to yt-dlp`);
-      }
     }
   }
 
