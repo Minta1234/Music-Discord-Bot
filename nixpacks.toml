@@ -1,12 +1,29 @@
 [variables]
 NIXPACKS_NODE_VERSION = "22.19.0"
+NODE_ENV = "production"
+PORT = "4000"
 TZ = "Asia/Bangkok"
 
 [phases.setup]
-aptPkgs = ["ffmpeg", "python3", "ca-certificates", "tzdata"]
+aptPkgs = [
+  "ffmpeg",
+  "python3",
+  "ca-certificates",
+  "tzdata",
+  "curl",
+  "build-essential"
+]
+cmds = [
+  "ln -sf /usr/bin/python3 /usr/bin/python || true",
+  "curl -L https://github.com/yt-dlp/yt-dlp/releases/latest/download/yt-dlp -o /usr/local/bin/yt-dlp && chmod a+rx /usr/local/bin/yt-dlp"
+]
 
 [phases.install]
 cmds = [
-  "ln -sf /usr/bin/python3 /usr/bin/python || true",
-  "npm install --omit=dev"
+  "npm install --omit=dev --no-audit --no-fund --legacy-peer-deps",
+  "mkdir -p data logs"
 ]
+
+[start]
+cmd = "npm start"
+
