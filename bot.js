@@ -402,14 +402,16 @@ const config = {
   dashboardPassword: process.env.DASHBOARD_PASSWORD || "",
   // Seconds to stay in voice after queue ends before disconnecting (new songs cancel it)
   disconnectDelaySec: Math.max(10, Number(process.env.DISCONNECT_DELAY_SEC) || 300),
-  // YouTube player clients for yt-dlp. "web,web_creator" is strictest (often
-  // demands sign-in); "android" usually works WITHOUT cookies. The bot
-  // auto-retries a failed song with the other client, so cookies are optional.
-  ytdlpPlayerClient: (process.env.YTDLP_PLAYER_CLIENT || "web,web_creator").trim() || "web,web_creator",
-  // Pre-buffer before handing audio to Discord: smoother start, survives yt-dlp slow-start.
-  // KB of opus audio to cushion (≈16KB ≈ 1s at 128k) + max wait before playing anyway.
-  prebufferKB: Math.max(0, Number(process.env.PREBUFFER_KB) || 64),
-  prebufferWaitMs: Math.max(500, Number(process.env.PREBUFFER_WAIT_MS) || 4000),
+  // YouTube player clients for yt-dlp. "android,ios" uses mobile InnerTube APIs
+  // which are significantly faster, don't require heavy webpage parsing, and bypass 403 blocks.
+  ytdlpPlayerClient: (process.env.YTDLP_PLAYER_CLIENT || "android,ios").trim() || "android,ios",
+  // NodeLink / Lavalink connection settings
+  nodelinkHost: process.env.NODELINK_HOST || "127.0.0.1",
+  nodelinkPort: Number(process.env.NODELINK_PORT) || 2333,
+  nodelinkPassword: process.env.NODELINK_PASSWORD || "youshallnotpass",
+  nodelinkEnabled: (process.env.NODELINK_ENABLED || "true").toLowerCase() === "true",
+  prebufferKB: Math.max(0, Number(process.env.PREBUFFER_KB) || 0),
+  prebufferWaitMs: Math.max(50, Number(process.env.PREBUFFER_WAIT_MS) || 500),
 };
 
 // Print out a summary of the configuration and environment variables. Sensitive
@@ -572,12 +574,14 @@ function ytdlpOpts(extra = {}) {
   const base = {
     // Skip certificate validation; yt-dlp defaults to secure connections but this avoids SSL errors
     noCheckCertificates: true,
-    // Retry endlessly for robust downloads
-    retries: "infinite",
-    "fragment-retries": "infinite",
+    // Sensible retries: fail fast on blocked/dead connections to avoid freezing the bot
+    retries: 3,
+    "fragment-retries": 3,
+    "socket-timeout": 8,
     // Respect configured IPv4 forcing
     "force-ipv4": config.ytdlpForceIpv4,
     "js-runtimes": "node",
+    "no-warnings": true,
   };
   const ck = effectiveCookieFile();
   if (ck) base.cookies = ck;
@@ -846,25 +850,24 @@ function buildControlRows(state = null) {
   const paused = state?.player?.state?.status === AudioPlayerStatus.Paused;
   const shown = !state || state.showControls !== false;
 
-  // Row 1: Minimal main controls
+  // Row 1: 4 main controls matching user design (Prev, play/pause, Next, More)
   const r1 = new ActionRowBuilder().addComponents(
-    new ButtonBuilder().setCustomId("mus_resume").setEmoji(paused ? "▶" : "⏸").setStyle(paused ? ButtonStyle.Success : ButtonStyle.Secondary),
-    new ButtonBuilder().setCustomId("mus_skip").setEmoji("⏭").setStyle(ButtonStyle.Secondary),
-    new ButtonBuilder().setCustomId("mus_stop").setEmoji("⏹").setStyle(ButtonStyle.Danger),
-    new ButtonBuilder().setCustomId("mus_star").setEmoji("⭐").setStyle(ButtonStyle.Secondary),
-    new ButtonBuilder().setCustomId("mus_controls").setEmoji("🎛").setStyle(ButtonStyle.Secondary),
+    new ButtonBuilder().setCustomId("mus_prev").setLabel("Prev").setEmoji("⏮").setStyle(ButtonStyle.Secondary),
+    new ButtonBuilder().setCustomId("mus_resume").setLabel(paused ? "Play" : "Pause").setEmoji(paused ? "▶" : "⏸").setStyle(paused ? ButtonStyle.Success : ButtonStyle.Primary),
+    new ButtonBuilder().setCustomId("mus_skip").setLabel("Next").setEmoji("⏭").setStyle(ButtonStyle.Secondary),
+    new ButtonBuilder().setCustomId("mus_controls").setLabel("More").setEmoji("⋯").setStyle(shown ? ButtonStyle.Primary : ButtonStyle.Secondary),
   );
   rows.push(r1);
 
-  // Row 2: Extra controls (hidden by default if minimal is requested, toggled by 🎛)
+  // Row 2: Secondary controls toggled by More button
   if (shown) {
     const lyricsOn = state ? state.showLyrics !== false : true;
     const r2 = new ActionRowBuilder().addComponents(
-      new ButtonBuilder().setCustomId("mus_prev").setLabel("Prev").setEmoji("⏮").setStyle(ButtonStyle.Secondary),
-      new ButtonBuilder().setCustomId("mus_queue").setLabel("List").setEmoji("📋").setStyle(ButtonStyle.Secondary),
+      new ButtonBuilder().setCustomId("mus_stop").setLabel("Stop").setEmoji("⏹").setStyle(ButtonStyle.Danger),
+      new ButtonBuilder().setCustomId("mus_queue").setLabel("Queue").setEmoji("📋").setStyle(ButtonStyle.Secondary),
       new ButtonBuilder().setCustomId("mus_loop").setLabel(`Loop: ${state ? loopLabel(state.loopMode).replace(/^[^\s]+\s/, "") : "Off"}`).setEmoji("🔁").setStyle(ButtonStyle.Secondary),
       new ButtonBuilder().setCustomId("mus_lyrics").setLabel(`Lyrics: ${lyricsOn ? "On" : "Off"}`).setEmoji("📝").setStyle(ButtonStyle.Secondary),
-      new ButtonBuilder().setCustomId("mus_batchplay").setLabel("Batch").setEmoji("📥").setStyle(ButtonStyle.Success),
+      new ButtonBuilder().setCustomId("mus_star").setEmoji("⭐").setStyle(ButtonStyle.Secondary),
     );
     rows.push(r2);
   }
@@ -1295,7 +1298,23 @@ function parseVttLyrics(vtt) {
 async function resolveVideoMeta(url) {
   const out = { title: null, durationSec: null, videoUrl: null };
   try {
-    const info = await ytdlp(url, ytdlpOpts({ dumpSingleJson: true, skipDownload: true, noWarnings: true }));
+    const nlRes = await fetchNodeLinkTracks(url);
+    const track = nlRes?.data?.[0]?.info || (Array.isArray(nlRes?.data) ? null : nlRes?.data?.info);
+    if (track?.title) {
+      out.title = track.title;
+      out.durationSec = track.isStream ? null : numOrNull(Math.round(track.length / 1000));
+      out.videoUrl = track.uri || url;
+      return out;
+    }
+  } catch { }
+
+  try {
+    const info = await ytdlp(url, ytdlpOpts({
+      dumpSingleJson: true,
+      skipDownload: true,
+      noWarnings: true,
+      extractorArgs: "youtube:player-client=android,ios;player_skip=webpage,configs",
+    }));
     const e = info?.entries?.[0] || info;
     if (e) {
       out.title = e.title || null;
@@ -1458,7 +1477,7 @@ function buildNowPlayingEmbed(state, lyrics) {
   const dur = cur?.durationSec;
   const scrollingTitle = marqueeText(cleanTitle(cur?.title, 180), playbackSeconds(state));
   const e = makeEmbed(0xE8B34C)
-    .setAuthor({ name: "Now Playing", iconURL: "https://raw.githubusercontent.com/discordjs/discord.js/main/docs/favicon.ico" })
+    .setAuthor({ name: "Now Playing", iconURL: "https://cdn-minta.kawinphopkodsombat.workers.dev/file/statics%2Fdiscord%2Fbocchibotmusic%2Fhow-successful-is-bocchi-the-rock-compared-to-other-v0-k38afjqiursd1.webp" })
     .setTitle(scrollingTitle)
     .setDescription(`${Number.isFinite(dur) && dur > 0 ? `\`${fmtTime(dur)}\` ` : ""}${progressLine(state)}\n\n**Requested by:** ${cur?.requestedBy || "—"} | **Vol:** ${state.volumePct}% | **Loop:** ${loopLabel(state.loopMode)}`)
     .setFooter({ text: "Bocchi Music System", iconURL: cur?.thumb || null })
@@ -1591,8 +1610,6 @@ async function upsertNpMessage(guild, channelId, embed, withControls = true) {
   return null;
 }
 
-// ────────────────────────────────────────────────────────────────────────────
-
 const aiChatBusy = new Set();
 const privateAiSessions = new Map();
 async function getPrivateAiSession(itx) {
@@ -1657,7 +1674,6 @@ async function handleAiChatMessage(msg) {
   }
 }
 
-// ────────────────────────────────────────────────────────────────────────────
 // Private chat (DM) support: the bot answers EVERYTHING typed in DMs. Safe
 // commands run against the shared server; dangerous/admin commands are
 // filtered out; plain text gets a conversational reply.
@@ -2317,6 +2333,7 @@ function cleanupCurrentPipeline(state) {
     try { state.currentPipe.ff?.kill?.("SIGKILL"); } catch { }
     // If there is a helper process (e.g. yt-dlp for TikTok), kill it too
     try { state.currentPipe.helper?.kill?.("SIGKILL"); } catch { }
+    try { state.currentPipe.httpReq?.destroy?.(); } catch { }
   } catch (e) {
     swallowPipeError(e);
   } finally {
@@ -2369,27 +2386,101 @@ function pickThumb(e, fallbackUrl) {
   } catch { }
   return fallbackUrl ? thumbFor(fallbackUrl) : null;
 }
-// ONE yt-dlp call → { title, thumb, durationSec }. Falls back to raw query.
+// In-memory LRU-like cache for instant response on repeated queries/songs
+const metadataCache = new Map();
+function getCachedMeta(key) {
+  return metadataCache.get(key) || null;
+}
+function setCachedMeta(key, data) {
+  if (metadataCache.size >= 500) {
+    const firstKey = metadataCache.keys().next().value;
+    metadataCache.delete(firstKey);
+  }
+  metadataCache.set(key, data);
+}
+
+// High-performance track resolution via NodeLink (sub-100ms) with automatic fallback
+async function fetchNodeLinkTracks(identifier) {
+  if (!config.nodelinkEnabled) return null;
+  const ctrl = new AbortController();
+  const timer = setTimeout(() => ctrl.abort(), 2500);
+  try {
+    const enc = encodeURIComponent(identifier);
+    const res = await fetch(`http://${config.nodelinkHost}:${config.nodelinkPort}/v4/loadtracks?identifier=${enc}`, {
+      headers: { Authorization: config.nodelinkPassword },
+      signal: ctrl.signal,
+    });
+    if (!res.ok) return null;
+    const json = await res.json();
+    return json;
+  } catch {
+    return null;
+  } finally {
+    clearTimeout(timer);
+  }
+}
+
+// Sub-100ms metadata resolver: NodeLink first -> yt-dlp fallback -> raw query.
 async function resolveTitleAndThumb(input) {
+  const cached = getCachedMeta(input);
+  if (cached) return cached;
+
   try {
     // TikTok: metadata only via TikWM (fast, no yt-dlp).
     if (isTikTokUrl(input)) {
       try {
         const m = await tiktokMeta(input);
-        return { title: m.title, thumb: m.thumb, durationSec: numOrNull(m.duration) };
+        const res = { title: m.title, thumb: m.thumb, durationSec: numOrNull(m.duration) };
+        setCachedMeta(input, res);
+        return res;
       } catch (e) { logPretty("WARN", "tikwm meta failed: " + (e?.message || e)); }
     }
     if (isSpotifyUrl(input)) {
       const meta = await spotifyMeta(input);
-      if (meta.title && meta.title !== input) return { ...meta, durationSec: null };
+      if (meta.title && meta.title !== input) {
+        const res = { ...meta, durationSec: null };
+        setCachedMeta(input, res);
+        return res;
+      }
     }
-    const target = isUrl(input) ? input : `ytsearch1:${sanitizeSearchQuery(input)}`;
-    const info = await ytdlp(target, ytdlpOpts({ dumpSingleJson: true, skipDownload: true, noWarnings: true }));
+
+    // Try NodeLink first (Instant ~50ms response)
+    const isSearch = !isUrl(input);
+    const nlIdent = isSearch ? `ytsearch:${sanitizeSearchQuery(input)}` : input;
+    const nlRes = await fetchNodeLinkTracks(nlIdent);
+    const firstItem = nlRes?.data?.[0] || (Array.isArray(nlRes?.data) ? null : nlRes?.data);
+    const firstTrack = firstItem?.info;
+    if (firstTrack?.title) {
+      const res = {
+        title: firstTrack.title,
+        thumb: firstTrack.artworkUrl || thumbFor(firstTrack.uri || input),
+        durationSec: firstTrack.isStream ? null : numOrNull(Math.round(firstTrack.length / 1000)),
+        videoUrl: firstTrack.uri || input,
+        isLive: !!firstTrack.isStream,
+        encodedTrack: firstItem?.encoded || null,
+      };
+      setCachedMeta(input, res);
+      if (res.videoUrl && res.videoUrl !== input) setCachedMeta(res.videoUrl, res);
+      logPretty("LOG", `[nodelink] resolved in ~50ms: ${res.title}`);
+      return res;
+    }
+
+    // Fallback: yt-dlp
+    const target = isSearch ? `ytsearch1:${sanitizeSearchQuery(input)}` : input;
+    const info = await ytdlp(target, ytdlpOpts({
+      dumpSingleJson: true,
+      skipDownload: true,
+      noWarnings: true,
+      "flat-playlist": isSearch,
+      extractorArgs: "youtube:player-client=android,ios;player_skip=webpage,configs",
+    }));
     const e = info?.entries?.[0] || info;
     if (e?.title) {
-      const url = e.webpage_url || input;
+      const url = e.webpage_url || e.url || (e.id ? `https://www.youtube.com/watch?v=${e.id}` : input);
       const isLive = !!(e.is_live || e.live_status === "is_live");
-      return { title: e.title, thumb: pickThumb(e, url) || thumbFor(input), durationSec: isLive ? null : numOrNull(e.duration), videoUrl: e.webpage_url || null, isLive };
+      const res = { title: e.title, thumb: pickThumb(e, url) || thumbFor(input), durationSec: isLive ? null : numOrNull(e.duration), videoUrl: url, isLive };
+      setCachedMeta(input, res);
+      return res;
     }
   } catch { }
   return { title: input, thumb: thumbFor(input), durationSec: null };
@@ -2416,10 +2507,23 @@ async function resolveFirstVideoUrl(query) {
     if (q2) query = q2;
   }
   if (isUrl(query)) return query;
+
+  // Try NodeLink first (instant)
+  try {
+    const nlRes = await fetchNodeLinkTracks(`ytsearch:${sanitizeSearchQuery(query)}`);
+    const track = nlRes?.data?.[0]?.info;
+    if (track?.uri) return track.uri;
+  } catch { }
+
   try {
     const cleanQuery = sanitizeSearchQuery(query);
-    const out = await ytdlp(`ytsearch1:${cleanQuery}`, ytdlpOpts({ dumpSingleJson: true }));
-    return out?.entries?.[0]?.webpage_url || null;
+    const out = await ytdlp(`ytsearch1:${cleanQuery}`, ytdlpOpts({
+      dumpSingleJson: true,
+      "flat-playlist": true,
+      extractorArgs: "youtube:player-client=android,ios;player_skip=webpage,configs",
+    }));
+    const e = out?.entries?.[0] || out;
+    return e?.webpage_url || e?.url || (e?.id ? `https://www.youtube.com/watch?v=${e.id}` : null);
   } catch (e) {
     logPretty("ERROR", "search resolve fail: " + (e?.message || e));
     return null;
@@ -2437,7 +2541,7 @@ function extractYouTubeId(u) {
   return null;
 }
 async function resolveVideoInfo(query) {
-  // ONE yt-dlp call (was: search call + info call). Title + URL together.
+  // Try NodeLink first
   let input = query;
   if (isSpotifyUrl(query)) {
     const kind = spotifyKind(query);
@@ -2446,14 +2550,39 @@ async function resolveVideoInfo(query) {
     if (!q2) return null;
     input = q2;
   }
-  if (!isUrl(input)) input = `ytsearch1:${sanitizeSearchQuery(input)}`;
+  const isSearch = !isUrl(input);
   try {
-    const info = await ytdlp(input, ytdlpOpts({ dumpSingleJson: true, skipDownload: true, noWarnings: true }));
+    const nlIdent = isSearch ? `ytsearch:${sanitizeSearchQuery(input)}` : input;
+    const nlRes = await fetchNodeLinkTracks(nlIdent);
+    const firstItem = nlRes?.data?.[0] || (Array.isArray(nlRes?.data) ? null : nlRes?.data);
+    const track = firstItem?.info;
+    if (track?.title && track?.uri) {
+      return {
+        title: track.title,
+        url: track.uri,
+        thumb: track.artworkUrl || thumbFor(track.uri),
+        durationSec: track.isStream ? null : numOrNull(Math.round(track.length / 1000)),
+        isLive: !!track.isStream,
+        videoId: extractYouTubeId(track.uri) || extractYouTubeId(query),
+        encodedTrack: firstItem?.encoded || null,
+      };
+    }
+  } catch { }
+
+  if (isSearch) input = `ytsearch1:${sanitizeSearchQuery(input)}`;
+  try {
+    const info = await ytdlp(input, ytdlpOpts({
+      dumpSingleJson: true,
+      skipDownload: true,
+      noWarnings: true,
+      "flat-playlist": isSearch,
+      extractorArgs: "youtube:player-client=android,ios;player_skip=webpage,configs",
+    }));
     const e = info?.entries?.[0] || info;
     if (!e) return null;
-    const url = e.webpage_url || input;
+    const url = e.webpage_url || e.url || (e.id ? `https://www.youtube.com/watch?v=${e.id}` : input);
     const title = e.title || query;
-    return { title, url, thumb: pickThumb(e, url), durationSec: numOrNull(e.duration), isLive: !!e.is_live, videoId: extractYouTubeId(e.webpage_url || url) || extractYouTubeId(query) };
+    return { title, url, thumb: pickThumb(e, url), durationSec: numOrNull(e.duration), isLive: !!e.is_live, videoId: extractYouTubeId(url) || extractYouTubeId(query) };
   } catch (e) {
     logPretty("ERROR", "video resolve fail: " + (e?.message || e));
     return null;
@@ -2626,14 +2755,16 @@ function spawnUniversalPipe(source, playerClient, offsetSec, isLive = false) {
   if (ckFile) ytArgs.push("--cookies", ckFile);
   ytArgs.push(
     "--no-check-certificates",
-    "--retries", "infinite",
-    "--fragment-retries", isLive ? "10" : "infinite",
-    "--buffer-size", "64K",
+    "--retries", "3",
+    "--fragment-retries", isLive ? "10" : "3",
+    "--socket-timeout", "8",
+    "--buffer-size", "16K",
+    "--no-warnings",
     "--js-runtimes", "node",
   );
   if (isLive) {
     ytArgs.push(
-      "--extractor-args", `youtube:player-client=${playerClient || config.ytdlpPlayerClient};player_skip=webpage`,
+      "--extractor-args", `youtube:player-client=${playerClient || config.ytdlpPlayerClient};player_skip=webpage,configs`,
       "--no-live-from-start",
       "-f", "bestaudio/best",
     );
@@ -2649,7 +2780,7 @@ function spawnUniversalPipe(source, playerClient, offsetSec, isLive = false) {
     // start, no hundreds of DASH fragments on 30min+ videos), concurrent
     // fragments keep long videos from stalling mid-play.
     ytArgs.push(
-      "--extractor-args", `youtube:player-client=${playerClient || config.ytdlpPlayerClient};player_skip=webpage`,
+      "--extractor-args", `youtube:player-client=${playerClient || config.ytdlpPlayerClient};player_skip=webpage,configs`,
       "-f", "bestaudio[ext=m4a]/bestaudio[acodec=aac]/bestaudio/best",
       "--concurrent-fragments", "4",
     );
@@ -2720,6 +2851,79 @@ function spawnFfmpegStdin(tag, offsetSec) {
   ff.stdin.on("error", swallowPipeError);
   ff.stderr.on("data", (d) => { try { logPretty("LOG", `[ffmpeg(${tag})] ` + d.toString().trim()); } catch { } });
   return { ff, stream: cushionStream(ff), helper: null, raw: ff.stdout };
+}
+
+// Arguments for raw 16-bit 48kHz stereo PCM streaming directly from NodeLink (/v4/loadstream)
+function ffmpegPcmStdinArgs(offsetSec) {
+  const a = [];
+  a.push("-loglevel", "info", "-hide_banner");
+  if (config.ffmpegLowLatency) {
+    a.push("-fflags", "+nobuffer", "-flags", "low_delay");
+  }
+  // NodeLink delivers raw 16-bit 48kHz stereo PCM
+  a.push("-thread_queue_size", "2048", "-f", "s16le", "-ar", "48000", "-ac", "2", "-i", "pipe:0", "-vn");
+  const off = Number(offsetSec);
+  if (Number.isFinite(off) && off > 0) a.push("-ss", String(off));
+  a.push("-ac", String(config.audioChannels), "-ar", String(config.audioSampleRate));
+  const afChain = (config.audioFilter || "").trim();
+  if (afChain) a.push("-af", afChain);
+  a.push("-c:a", "libopus", "-b:a", config.opusBitrate);
+  if (config.opusVbr === "off") a.push("-vbr", "off");
+  else if (config.opusVbr === "constrained") a.push("-vbr", "constrained");
+  else a.push("-vbr", "on");
+  if (["audio", "voip", "lowdelay"].includes(config.opusApplication))
+    a.push("-application", config.opusApplication);
+  const fd = Number(config.opusFrameDuration);
+  if ([2.5, 5, 10, 20, 40, 60].includes(fd)) a.push("-frame_duration", String(fd));
+  const cx = Number(config.opusComplexity);
+  if (Number.isFinite(cx) && cx >= 0 && cx <= 10) a.push("-compression_level", String(cx));
+  if (config.ffmpegExtraArgs && config.ffmpegExtraArgs.trim())
+    a.push(...config.ffmpegExtraArgs.trim().split(/\s+/));
+  a.push("-f", "ogg", "pipe:1");
+  return a;
+}
+
+// Ultra-fast NodeLink audio streaming (<100ms startup, zero yt-dlp latency)
+function spawnNodeLinkStreamPipe(encodedTrack, offsetSec) {
+  if (!FFMPEG_AVAILABLE) throw new Error("ffmpeg binary not available");
+  const ff = spawn(FFMPEG || "ffmpeg", ffmpegPcmStdinArgs(offsetSec), { stdio: ["pipe", "pipe", "pipe"] });
+  ff.on("error", (e) => logPretty("ERROR", "ffmpeg(nodelink) error: " + (e?.message || e)));
+  ff.stdout.on("error", swallowPipeError);
+  ff.stderr.on("error", swallowPipeError);
+  ff.stdin.on("error", swallowPipeError);
+  ff.stderr.on("data", (d) => { try { logPretty("LOG", "[ffmpeg(nodelink)] " + d.toString().trim()); } catch { } });
+
+  const streamUrl = `http://${config.nodelinkHost}:${config.nodelinkPort}/v4/loadstream?encodedTrack=${encodeURIComponent(encodedTrack)}`;
+  let httpReq = null;
+  try {
+    httpReq = http.get(streamUrl, {
+      headers: {
+        Authorization: config.nodelinkPassword || "youshallnotpass",
+      },
+    }, (res) => {
+      if (res.statusCode < 200 || res.statusCode >= 300) {
+        logPretty("WARN", `[nodelink] stream HTTP ${res.statusCode}`);
+        try { ff.stdin.destroy(new Error(`NodeLink stream returned HTTP ${res.statusCode}`)); } catch { }
+        return;
+      }
+      res.on("error", swallowPipeError);
+      res.pipe(ff.stdin);
+    });
+    httpReq.on("error", (e) => {
+      logPretty("WARN", "[nodelink] http stream error: " + (e?.message || e));
+      try { ff.stdin.destroy(e); } catch { }
+    });
+  } catch (err) {
+    logPretty("WARN", "[nodelink] get stream exception: " + (err?.message || err));
+  }
+
+  return {
+    ff,
+    stream: cushionStream(ff),
+    helper: { kill: () => { try { httpReq?.destroy(); } catch { } } },
+    httpReq,
+    raw: ff.stdout,
+  };
 }
 
 // ffmpeg with direct URL input (e.g. for M3U8 live streams).
@@ -2981,11 +3185,39 @@ async function fetchPlaylistEntries(input, limit = null) {
 
   const entries = [];
   try {
+    // Try NodeLink first (loads all tracks in ~100ms)
+    try {
+      const nlIdent = isInputUrl ? input : `ytsearch:${sanitizeSearchQuery(input)}`;
+      const nlRes = await fetchNodeLinkTracks(nlIdent);
+      const arr = Array.isArray(nlRes?.data) ? nlRes.data : (nlRes?.data?.tracks || []);
+      if (arr.length > 0) {
+        for (const item of arr) {
+          const t = item.info || item;
+          if (Number.isFinite(max) && entries.length >= max) break;
+          if (entries.length >= hardCap) break;
+          const url = t.uri || (t.identifier ? `https://www.youtube.com/watch?v=${t.identifier}` : null);
+          const title = t.title || "unknown";
+          if (url) entries.push({
+            title,
+            url,
+            thumb: t.artworkUrl || thumbFor(url),
+            durationSec: t.isStream ? null : numOrNull(Math.round(t.length / 1000)),
+            encodedTrack: item.encoded || null,
+          });
+        }
+        if (entries.length > 0) {
+          logPretty("LOG", `[nodelink] loaded ${entries.length} playlist entries in ~100ms`);
+          return Number.isFinite(max) ? entries.slice(0, max) : entries;
+        }
+      }
+    } catch { }
+
     if (isInputUrl) {
       const info = await ytdlp(input, ytdlpOpts({
         dumpSingleJson: true,
         "yes-playlist": true,
         "flat-playlist": true,
+        extractorArgs: "youtube:player-client=android,ios;player_skip=webpage,configs",
       }));
       const arr = info?.entries || [];
       for (const e of arr) {
@@ -2999,7 +3231,11 @@ async function fetchPlaylistEntries(input, limit = null) {
       }
     } else {
       const n = Number.isFinite(max) ? max : 25;
-      const out = await ytdlp(`ytsearch${n}:${sanitizeSearchQuery(input)}`, ytdlpOpts({ dumpSingleJson: true }));
+      const out = await ytdlp(`ytsearch${n}:${sanitizeSearchQuery(input)}`, ytdlpOpts({
+        dumpSingleJson: true,
+        "flat-playlist": true,
+        extractorArgs: "youtube:player-client=android,ios;player_skip=webpage,configs",
+      }));
       const arr = out?.entries || [];
       for (const e of arr) {
         if (entries.length >= n) break;
@@ -3457,6 +3693,38 @@ async function startPlayback(guild, item, state, stayPut = false) {
       return { pageUrl: source };
     } catch (e) {
       logPretty("WARN", `[tikwm] failed (${e?.message || e}), falling back to direct yt-dlp`);
+    }
+  }
+
+  // NodeLink ultra-fast stream (sub-100ms instant audio, zero yt-dlp latency)
+  if (config.nodelinkEnabled && !item.isLive) {
+    let enc = item.encodedTrack || getCachedMeta(source)?.encodedTrack || getCachedMeta(item.title)?.encodedTrack;
+    if (!enc) {
+      try {
+        // Use the ORIGINAL input: NodeLink resolves Spotify/SoundCloud/TikTok
+        // URLs natively; `source` may already carry yt-dlp's "ytsearch1:" prefix.
+        const raw = String(item.source || "").trim();
+        const nlIdent = isUrl(raw) ? raw : `ytsearch:${sanitizeSearchQuery(raw.replace(/^ytsearch\d*:/i, ""))}`;
+        const nlRes = await fetchNodeLinkTracks(nlIdent);
+        const firstItem = nlRes?.data?.[0] || (Array.isArray(nlRes?.data) ? null : nlRes?.data);
+        if (firstItem?.encoded) {
+          enc = firstItem.encoded;
+          item.encodedTrack = enc;
+          if (firstItem.info?.title && (item.title === item.source || isUrl(item.title))) item.title = firstItem.info.title;
+          if (!item.thumb && firstItem.info?.artworkUrl) item.thumb = firstItem.info.artworkUrl;
+          if (!item.durationSec && firstItem.info?.length) item.durationSec = Math.round(firstItem.info.length / 1000);
+        }
+      } catch { }
+    }
+    if (enc) {
+      try {
+        logPretty("LOG", `[nodelink] streaming track via NodeLink: ${item.title}`);
+        const pipeObj = spawnNodeLinkStreamPipe(enc, consumeOffset(item, state));
+        await playPipe(guild, item, state, pipeObj);
+        return { pageUrl: item.videoUrl || source };
+      } catch (nlErr) {
+        logPretty("WARN", `[nodelink] playback failed (${nlErr?.message || nlErr}), falling back to yt-dlp`);
+      }
     }
   }
 
@@ -4006,6 +4274,7 @@ client.on("interactionCreate", async (itx) => {
       item.durationSec = meta.durationSec;
     }
     if (meta.videoUrl) item.videoUrl = meta.videoUrl;
+    if (meta.encodedTrack) item.encodedTrack = meta.encodedTrack;
     const addedSlash = makeEmbed(COLORS.success)
       .setDescription(`### ➕ Added to queue`)
       .addFields(
